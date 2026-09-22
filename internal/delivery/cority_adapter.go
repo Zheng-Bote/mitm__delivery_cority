@@ -428,17 +428,19 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 	}
 
 	done := make(chan struct{})
-	go func() {
-		timer300 := time.NewTimer(300 * time.Second)
-		defer timer300.Stop()
-		select {
-		case <-timer300.C:
-			if a.logAudit != nil {
-				a.logAudit(fmt.Sprintf("Upload Warning: Delivery is taking longer than 300 seconds. Configured timeout is %d seconds.", configuredTimeout))
+	if configuredTimeout > 300 {
+		go func() {
+			timer300 := time.NewTimer(300 * time.Second)
+			defer timer300.Stop()
+			select {
+			case <-timer300.C:
+				if a.logAudit != nil {
+					a.logAudit(fmt.Sprintf("Upload Warning: Delivery is taking longer than 300 seconds. Configured timeout is %d seconds.", configuredTimeout))
+				}
+			case <-done:
 			}
-		case <-done:
-		}
-	}()
+		}()
+	}
 
 	startTime := time.Now()
 	resp3, err := activeClient.Do(req3)
