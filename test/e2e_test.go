@@ -27,6 +27,9 @@ type Config struct {
 func loadConfig(t *testing.T) Config {
 	configPath := "../../../data/config.json"
 	b, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		t.Skipf("skipping: database config %s not found", configPath)
+	}
 	if err != nil {
 		t.Fatalf("failed to read config: %v", err)
 	}

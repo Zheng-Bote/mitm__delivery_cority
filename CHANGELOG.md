@@ -1,5 +1,38 @@
 # Changelog - MitM Cority Delivery Layer
 
+## [v0.21.0] - 2026-10-17
+
+Hardening of the Cority delivery job ([#2](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/2)).
+
+### Added
+
+- **Recovery**: Packages stuck in `sending` (crash, SIGTERM) are reset to `pending` at start and end of each run.
+- **401 Re-Authentication**: An import rejected with HTTP 401 invalidates the cached token, re-authenticates once and retries.
+- **Upload Chunking**: `upload_options.batch_size` splits a package into several import requests with deterministic per-chunk `Idempotency-Key`s.
+- **Job Parameter** `blocking_max_runtime_minutes`: ignores stale blocking runs; the audit message shows the age of the blocking run.
+- **Final Status Event**: `finished` / `failed` / `cancelled` with delivered, retry, DLQ and interrupted counts.
+- Unit tests for the Cority adapter, envelope crypto and the DB connection string.
+
+### Changed
+
+- **Exit Codes**: `1` on fatal configuration errors (with `failed` IPC event), `2` if packages were moved to the DLQ.
+- **Packaging**: A package contains at most `batch_size` fragments (previously `batch_size × 10`).
+- `slowdown` and `timeout` accept JSON numbers as well as strings.
+- The Cority response body is only audit-logged on failure (truncated to 1 KiB); the slowdown state is logged once per run.
+- DB and e2e tests are skipped when `data/config.json` is missing.
+- `go.mod` lists direct dependencies correctly; version strings aligned (`main.go`, `Cargo.toml`).
+
+### Fixed
+
+- **Security**: Removed the silent mock-config fallback on `config_payload` decryption failure and the hardcoded fallback key for field decryption.
+- **Security**: `MASTER_KEY` must decode to exactly 32 bytes (no silent padding).
+- DB connection string now URL-escapes user and password.
+- Cority login body is JSON-encoded (credentials with `"` or `\` work).
+- Malformed target fragments are marked `FAILED` instead of being silently dropped as `PACKAGED`.
+- Status updates are persisted even if a shutdown cancels the context; interrupted packages no longer consume retries.
+- The upload slowdown wait aborts on SIGTERM.
+- The final audit message counts delivered packages instead of claimed packages.
+
 ## [v0.20.0] - 2026-09-19
 
 ### Changed

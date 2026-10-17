@@ -1,3 +1,20 @@
+/**
+ * SPDX-FileComment: Delivery Target Repository
+ * SPDX-FileType: SOURCE
+ * SPDX-FileContributor: ZHENG Robert
+ * SPDX-FileCopyrightText: 2026 ZHENG Robert
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * @file target_repo.go
+ * @brief Loads and decrypts the delivery target configuration of a topic
+ * @version 0.21.0
+ * @date 2026-10-17
+ *
+ * @author ZHENG Robert (robert@hase-zheng.net)
+ * @copyright Copyright (c) 2026 ZHENG Robert
+ * @LICENSE Apache-2.0
+ */
+
 package db
 
 import (
@@ -45,10 +62,13 @@ func (r *TargetRepo) GetDeliveryTarget(ctx context.Context, topic string) (*deli
 	} else {
 		kek = []byte(masterKeyStr)
 	}
+	if len(kek) != 32 {
+		return nil, fmt.Errorf("MASTER_KEY must be 32 bytes (AES-256), got %d bytes", len(kek))
+	}
 
 	decrypted, err := crypto.EnvelopeDecrypt(kek, wrappedKey, nonce, payload)
 	if err != nil {
-		decrypted = []byte(`{"client_id": "mock", "client_secret": "mock", "token_url": "mock", "import_path": "mock"}`)
+		return nil, fmt.Errorf("failed to decrypt config_payload for topic %s (wrong MASTER_KEY?): %w", topic, err)
 	}
 
 	// Fetch encrypted fields for the topic (via source -> rule -> target_field relationship)
