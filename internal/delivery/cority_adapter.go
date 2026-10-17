@@ -7,7 +7,7 @@
  *
  * @file cority_adapter.go
  * @brief Cority two-step authentication, field decryption, chunked import upload
- * @version 0.21.0
+ * @version 0.22.0
  * @date 2026-10-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -40,6 +40,9 @@ import (
 
 // maxLoggedBodyBytes limits how much of a failed Cority response is written to the audit log.
 const maxLoggedBodyBytes = 1024
+
+// maxRetryAfter caps the upload pause requested by a Retry-After header.
+const maxRetryAfter = time.Hour
 
 // flexInt accepts a JSON number or a numeric JSON string ("" and null count as 0).
 type flexInt int
@@ -83,6 +86,7 @@ type CorityAdapter struct {
 	logAudit       func(string)
 	mu             sync.Mutex
 	lastUpload     time.Time
+	pauseUntil     time.Time // set from Retry-After; no upload before this time
 	slowdownLogged bool
 	tokens         TokenStore
 }
@@ -115,12 +119,12 @@ func parseCorityDate(s string) time.Time {
 	return time.Time{}
 }
 
-func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempotencyKey string, payload []byte) error {
+func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempotencyKey string, payload []byte) (SendResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	cfg, err := ParseCorityAuthConfig(config.AuthConfig)
 	if err != nil {
-		return &DeliveryError{
+		return SendResult{}, &DeliveryError{
 			IsTransient:  false,
 			ErrorMessage: err.Error(),
 			ErrorCode:    "INVALID_CONFIG",
@@ -145,14 +149,14 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 		a.slowdownLogged = true
 	}
 	if cfg.Slowdown > 0 {
-		if delay := time.Duration(cfg.Slowdown)*time.Second - time.Since(a.lastUpload); delay > 0 {
-			timer := time.NewTimer(delay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				timer.Stop()
-				return &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload slowdown interrupted: %v", ctx.Err()), ErrorCode: "CANCELLED"}
-			}
+		if err := waitCtx(ctx, time.Duration(cfg.Slowdown)*time.Second-time.Since(a.lastUpload)); err != nil {
+			return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload slowdown interrupted: %v", err), ErrorCode: "CANCELLED"}
+		}
+	}
+	if delay := time.Until(a.pauseUntil); delay > 0 {
+		a.audit(fmt.Sprintf("Upload paused for %v as requested by Cority (Retry-After)", delay.Round(time.Second)))
+		if err := waitCtx(ctx, delay); err != nil {
+			return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload pause interrupted: %v", err), ErrorCode: "CANCELLED"}
 		}
 	}
 
@@ -164,19 +168,38 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 
 	accessToken, err := a.getAccessToken(ctx, activeClient, cfg, baseURL, connectionHash)
 	if err != nil {
-		return err
+		return SendResult{}, err
 	}
 
 	// Send Payload Data
-	var rawData []interface{}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	if err := decoder.Decode(&rawData); err != nil {
-		return &DeliveryError{IsTransient: false, ErrorMessage: "payload is not valid JSON array", ErrorCode: "INVALID_PAYLOAD"}
+	var rawRecords []json.RawMessage
+	if err := json.Unmarshal(payload, &rawRecords); err != nil {
+		return SendResult{}, &DeliveryError{IsTransient: false, ErrorMessage: "payload is not valid JSON array", ErrorCode: "INVALID_PAYLOAD"}
 	}
 
-	if err := a.decryptFields(rawData, config); err != nil {
-		return err
+	// Decrypt every record; a record with any undecryptable field is withheld, never sent
+	var result SendResult
+	rawData := make([]interface{}, 0, len(rawRecords))
+	for i, raw := range rawRecords {
+		var record interface{}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&record); err != nil {
+			return SendResult{}, &DeliveryError{IsTransient: false, ErrorMessage: "payload is not valid JSON array", ErrorCode: "INVALID_PAYLOAD"}
+		}
+		if err := a.decryptRecord(record, config); err != nil {
+			a.audit(fmt.Sprintf("Record #%d of package %s withheld: %v", i, idempotencyKey, err))
+			result.Rejected = append(result.Rejected, RejectedRecord{Index: i, Payload: raw, ErrorCode: "DECRYPT_FAIL", ErrorMessage: err.Error()})
+			continue
+		}
+		rawData = append(rawData, record)
+	}
+	if len(config.EncryptedFields) == 0 {
+		a.audit("No encrypted fields configured for this target.")
+	}
+	if len(rawData) == 0 && len(result.Rejected) > 0 {
+		a.audit(fmt.Sprintf("All %d records of package %s withheld; nothing to upload", len(result.Rejected), idempotencyKey))
+		return result, nil
 	}
 
 	// Convert all values to strings and nulls to empty strings recursively
@@ -214,36 +237,55 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 			a.audit(fmt.Sprintf("Uploading chunk %d/%d (%d records, Idempotency-Key: %s)", i+1, len(chunks), len(chunk), chunkKey))
 		}
 
-		status, body, err := a.upload(ctx, activeClient, cfg, baseURL, accessToken, chunkKey, chunk, configuredTimeout)
+		status, header, body, err := a.upload(ctx, activeClient, cfg, baseURL, accessToken, chunkKey, chunk, configuredTimeout)
 		if err != nil {
-			return err
+			return SendResult{}, err
 		}
 
 		if status == http.StatusUnauthorized {
 			// The cached token was rejected before its expiry: re-authenticate once and retry.
 			a.audit("Cority rejected the access token (HTTP 401). Invalidating cached token and re-authenticating...")
 			if err := a.tokens.Delete(ctx, connectionHash); err != nil {
-				return &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("failed to invalidate token: %v", err), ErrorCode: "DB_ERROR"}
+				return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("failed to invalidate token: %v", err), ErrorCode: "DB_ERROR"}
 			}
 			accessToken, err = a.getAccessToken(ctx, activeClient, cfg, baseURL, connectionHash)
 			if err != nil {
-				return err
+				return SendResult{}, err
 			}
-			status, body, err = a.upload(ctx, activeClient, cfg, baseURL, accessToken, chunkKey, chunk, configuredTimeout)
+			status, header, body, err = a.upload(ctx, activeClient, cfg, baseURL, accessToken, chunkKey, chunk, configuredTimeout)
 			if err != nil {
-				return err
+				return SendResult{}, err
 			}
 			if status == http.StatusUnauthorized {
 				a.audit(fmt.Sprintf("CORITY_SAAS Upload | Idempotency-Key: %s | Return Code: 401 after re-authentication | Response: %s", chunkKey, truncate(body)))
-				return &DeliveryError{IsTransient: true, HTTPCode: status, ErrorMessage: fmt.Sprintf("HTTP 401 after re-authentication: %s", string(body)), ErrorCode: "HTTP_401"}
+				return SendResult{}, &DeliveryError{IsTransient: true, HTTPCode: status, ErrorMessage: fmt.Sprintf("HTTP 401 after re-authentication: %s", string(body)), ErrorCode: "HTTP_401"}
 			}
 		}
 
-		if err := a.checkUploadResponse(baseURL+cfg.ImportPath, chunkKey, status, body); err != nil {
-			return err
+		if err := a.checkUploadResponse(baseURL+cfg.ImportPath, chunkKey, status, header, body); err != nil {
+			var delErr *DeliveryError
+			if errors.As(err, &delErr) && delErr.RetryAfter > 0 {
+				a.pauseUntil = time.Now().Add(delErr.RetryAfter)
+			}
+			return SendResult{}, err
 		}
 	}
-	return nil
+	return result, nil
+}
+
+// waitCtx sleeps for d (no-op if d <= 0) and returns early with the context error on cancellation.
+func waitCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // getAccessToken returns a valid cached access token or authenticates with Cority and caches the result.
@@ -297,12 +339,12 @@ func (a *CorityAdapter) authenticate(ctx context.Context, client *http.Client, c
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: fmt.Sprintf("refresh token failed: %s", string(bodyBytes)), ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: fmt.Sprintf("refresh token failed: %s", string(bodyBytes)), ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	var refreshResp map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&refreshResp); err != nil {
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "failed to parse refresh token response", ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "failed to parse refresh token response", ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	if val, ok := refreshResp["Token"].(string); ok && val != "" {
@@ -312,7 +354,7 @@ func (a *CorityAdapter) authenticate(ctx context.Context, client *http.Client, c
 	}
 
 	if token.RefreshToken == "" {
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "refresh token not found in response", ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "refresh token not found in response", ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	if val, ok := refreshResp["ExpiryDateTime"].(string); ok && val != "" {
@@ -334,12 +376,12 @@ func (a *CorityAdapter) authenticate(ctx context.Context, client *http.Client, c
 
 	if resp2.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp2.Body)
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: fmt.Sprintf("access token failed: %s", string(bodyBytes)), ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: fmt.Sprintf("access token failed: %s", string(bodyBytes)), ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	var tokenResp map[string]interface{}
 	if err := json.NewDecoder(resp2.Body).Decode(&tokenResp); err != nil {
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "failed to parse access token response", ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "failed to parse access token response", ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	if val, ok := tokenResp["AccessToken"].(string); ok && val != "" {
@@ -351,7 +393,7 @@ func (a *CorityAdapter) authenticate(ctx context.Context, client *http.Client, c
 	}
 
 	if token.AccessToken == "" {
-		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "access token not found in response", ErrorCode: "AUTH_FAIL"}
+		return nil, &DeliveryError{IsTransient: false, ErrorMessage: "access token not found in response", ErrorCode: "AUTH_FAIL", Abort: true}
 	}
 
 	if val, ok := tokenResp["AccessTokenExpiryDateTime"].(string); ok && val != "" {
@@ -374,111 +416,109 @@ func (a *CorityAdapter) authenticate(ctx context.Context, client *http.Client, c
 	return &token, nil
 }
 
-// decryptFields decrypts the configured encrypted fields of every record in place.
-// Any field that cannot be decrypted fails the whole package (no plaintext fallback, no fallback key).
-func (a *CorityAdapter) decryptFields(rawData []interface{}, config TargetConfig) error {
-	if len(config.EncryptedFields) == 0 {
-		a.audit("No encrypted fields configured for this target.")
+// decryptRecord decrypts a single record in place. Values in envelope object format
+// ({"ciphertext": ..., "nonce": ...}) are always decrypted; string values only for the
+// configured encrypted fields (legacy format). Any failure returns an error, without fallback key.
+func (a *CorityAdapter) decryptRecord(record interface{}, config TargetConfig) error {
+	m, ok := record.(map[string]interface{})
+	if !ok {
 		return nil
 	}
 
-	decryptFail := func(msg string) error {
-		a.audit(msg)
-		return &DeliveryError{IsTransient: false, ErrorMessage: msg, ErrorCode: "DECRYPT_FAIL"}
+	decrypt := func(key string, nonceBytes, ciphertextBytes []byte) error {
+		decrypted, err := crypto.EnvelopeDecrypt(config.KEK, config.WrappedKey, nonceBytes, ciphertextBytes)
+		if err != nil {
+			return fmt.Errorf("decryption failed for field %s: %w", key, err)
+		}
+
+		// The decrypted data might be a JSON-marshaled string (e.g., `"537732"` with quotes).
+		// We try to unmarshal it back to a primitive. If it fails, fallback to raw string.
+		var parsedVal interface{}
+		dec := json.NewDecoder(bytes.NewReader(decrypted))
+		dec.UseNumber()
+		errUnmarshal := dec.Decode(&parsedVal)
+		if errUnmarshal == nil {
+			if _, errTrailing := dec.Token(); errTrailing != io.EOF {
+				errUnmarshal = fmt.Errorf("trailing data found")
+			}
+		}
+		if errUnmarshal == nil {
+			m[key] = parsedVal
+		} else {
+			m[key] = string(decrypted)
+		}
+		return nil
 	}
 
-	for _, item := range rawData {
-		m, ok := item.(map[string]interface{})
-		if !ok {
+	// 1. Envelope objects, independent of the mapping
+	decryptedKeys := map[string]bool{}
+	for key, val := range m {
+		mapVal, isMap := val.(map[string]interface{})
+		if !isMap {
 			continue
 		}
-		for _, field := range config.EncryptedFields {
-			var targetKey string
-			var val interface{}
-			var exists bool
+		if _, hasCipher := mapVal["ciphertext"]; !hasCipher {
+			continue
+		}
+		cipherStr, _ := mapVal["ciphertext"].(string)
+		nonceStr, _ := mapVal["nonce"].(string)
+		nBytes, err1 := base64.StdEncoding.DecodeString(nonceStr)
+		cBytes, err2 := base64.StdEncoding.DecodeString(cipherStr)
+		if cipherStr == "" || nonceStr == "" || err1 != nil || err2 != nil {
+			return fmt.Errorf("invalid envelope format for field %s", key)
+		}
+		if err := decrypt(key, nBytes, cBytes); err != nil {
+			return err
+		}
+		decryptedKeys[key] = true
+	}
 
-			if v, ok := m[field]; ok {
-				val = v
-				targetKey = field
-				exists = true
-			} else {
-				// Case-insensitive fallback ignoring underscores
-				for k, v := range m {
-					if strings.EqualFold(strings.ReplaceAll(k, "_", ""), strings.ReplaceAll(field, "_", "")) {
-						val = v
-						targetKey = k
-						exists = true
-						break
-					}
+	// 2. Legacy string format for the configured encrypted fields
+	for _, field := range config.EncryptedFields {
+		var targetKey string
+		var val interface{}
+		var exists bool
+
+		if v, ok := m[field]; ok {
+			val = v
+			targetKey = field
+			exists = true
+		} else {
+			// Case-insensitive fallback ignoring underscores
+			for k, v := range m {
+				if strings.EqualFold(strings.ReplaceAll(k, "_", ""), strings.ReplaceAll(field, "_", "")) {
+					val = v
+					targetKey = k
+					exists = true
+					break
 				}
 			}
+		}
 
-			if !exists {
-				continue
-			}
+		strVal, isStr := val.(string)
+		if !exists || !isStr || strVal == "" || decryptedKeys[targetKey] {
+			continue
+		}
 
-			var nonceBytes, ciphertextBytes []byte
-
-			if mapVal, isMap := val.(map[string]interface{}); isMap {
-				// Handle map format: {"ciphertext": "...", "nonce": "..."}
-				cipherStr, _ := mapVal["ciphertext"].(string)
-				nonceStr, _ := mapVal["nonce"].(string)
-				if cipherStr == "" || nonceStr == "" {
-					continue
-				}
-				nBytes, err1 := base64.StdEncoding.DecodeString(nonceStr)
-				cBytes, err2 := base64.StdEncoding.DecodeString(cipherStr)
-				if err1 != nil || err2 != nil {
-					return decryptFail(fmt.Sprintf("Base64 decode failed for map field %s", targetKey))
-				}
-				nonceBytes = nBytes
-				ciphertextBytes = cBytes
-			} else if strVal, isStr := val.(string); isStr && strVal != "" {
-				// Handle legacy string format
-				decoded, err := base64.StdEncoding.DecodeString(strVal)
-				if err != nil {
-					decoded, err = base64.RawStdEncoding.DecodeString(strVal)
-				}
-				if err != nil {
-					return decryptFail(fmt.Sprintf("Base64 decode failed for string field %s: %v", targetKey, err))
-				}
-				if len(decoded) <= 12 {
-					return decryptFail(fmt.Sprintf("Decoded string data too short for field %s (len: %d)", targetKey, len(decoded)))
-				}
-				nonceBytes = decoded[:12]
-				ciphertextBytes = decoded[12:]
-			} else {
-				continue
-			}
-
-			decrypted, err := crypto.EnvelopeDecrypt(config.KEK, config.WrappedKey, nonceBytes, ciphertextBytes)
-			if err != nil {
-				return decryptFail(fmt.Sprintf("Decryption failed for field %s: %v", targetKey, err))
-			}
-
-			// The decrypted data might be a JSON-marshaled string (e.g., `"537732"` with quotes).
-			// We try to unmarshal it back to a primitive. If it fails, fallback to raw string.
-			var parsedVal interface{}
-			dec := json.NewDecoder(bytes.NewReader(decrypted))
-			dec.UseNumber()
-			errUnmarshal := dec.Decode(&parsedVal)
-			if errUnmarshal == nil {
-				if _, errTrailing := dec.Token(); errTrailing != io.EOF {
-					errUnmarshal = fmt.Errorf("trailing data found")
-				}
-			}
-			if errUnmarshal == nil {
-				m[targetKey] = parsedVal
-			} else {
-				m[targetKey] = string(decrypted)
-			}
+		decoded, err := base64.StdEncoding.DecodeString(strVal)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(strVal)
+		}
+		if err != nil {
+			return fmt.Errorf("base64 decode failed for field %s: %w", targetKey, err)
+		}
+		if len(decoded) <= 12 {
+			return fmt.Errorf("decoded data too short for field %s (len: %d)", targetKey, len(decoded))
+		}
+		if err := decrypt(targetKey, decoded[:12], decoded[12:]); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// upload posts one chunk of records to the Cority import endpoint and returns status code and body.
-func (a *CorityAdapter) upload(ctx context.Context, client *http.Client, cfg CorityAuthConfig, baseURL, accessToken, idempotencyKey string, records []interface{}, configuredTimeout int) (int, []byte, error) {
+// upload posts one chunk of records to the Cority import endpoint and returns status code, header and body.
+func (a *CorityAdapter) upload(ctx context.Context, client *http.Client, cfg CorityAuthConfig, baseURL, accessToken, idempotencyKey string, records []interface{}, configuredTimeout int) (int, http.Header, []byte, error) {
 	finalBody := map[string]interface{}{
 		"options": cfg.UploadOptions,
 		"records": records,
@@ -516,16 +556,16 @@ func (a *CorityAdapter) upload(ctx context.Context, client *http.Client, cfg Cor
 		} else {
 			a.audit(fmt.Sprintf("Upload Error: Network failure after %v: %v", elapsed, err))
 		}
-		return 0, nil, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("network error during upload: %v", err), ErrorCode: "NETWORK_ERROR"}
+		return 0, nil, nil, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("network error during upload: %v", err), ErrorCode: "NETWORK_ERROR"}
 	}
 	defer resp3.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(resp3.Body)
-	return resp3.StatusCode, bodyBytes, nil
+	return resp3.StatusCode, resp3.Header, bodyBytes, nil
 }
 
 // checkUploadResponse audit-logs the import result and maps non-2xx codes to a DeliveryError.
-func (a *CorityAdapter) checkUploadResponse(importReqURL, idempotencyKey string, statusCode int, bodyBytes []byte) error {
+func (a *CorityAdapter) checkUploadResponse(importReqURL, idempotencyKey string, statusCode int, header http.Header, bodyBytes []byte) error {
 	if statusCode >= 200 && statusCode < 300 {
 		a.audit(fmt.Sprintf("CORITY_SAAS Upload | Target: %s | Idempotency-Key: %s | Return Code: %d", importReqURL, idempotencyKey, statusCode))
 
@@ -560,16 +600,37 @@ func (a *CorityAdapter) checkUploadResponse(importReqURL, idempotencyKey string,
 	a.audit(fmt.Sprintf("CORITY_SAAS Upload | Target: %s | Idempotency-Key: %s | Return Code: %d | Response: %s", importReqURL, idempotencyKey, statusCode, truncate(bodyBytes)))
 
 	isTransient := false
+	var retryAfter time.Duration
 	if statusCode == http.StatusTooManyRequests || (statusCode >= 500 && statusCode <= 599) {
 		isTransient = true
+		retryAfter = parseRetryAfter(header.Get("Retry-After"), time.Now())
 	}
 
 	return &DeliveryError{
 		IsTransient:  isTransient,
+		RetryAfter:   retryAfter,
 		HTTPCode:     statusCode,
 		ErrorMessage: fmt.Sprintf("HTTP %d: %s", statusCode, string(bodyBytes)),
 		ErrorCode:    fmt.Sprintf("HTTP_%d", statusCode),
 	}
+}
+
+// parseRetryAfter parses a Retry-After value (delay seconds or HTTP date), capped at maxRetryAfter.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(value); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(value); err == nil {
+		d = t.Sub(now)
+	}
+	if d < 0 {
+		return 0
+	}
+	return min(d, maxRetryAfter)
 }
 
 // uploadBatchSize reads upload_options.batch_size (number or numeric string); 0 disables chunking.

@@ -38,6 +38,12 @@ type mockDLQRepo struct {
 	pkg       db.Package
 	errorCode string
 	errMsg    string
+	rejected  []delivery.RejectedRecord
+}
+
+func (m *mockDLQRepo) InsertRejectedRecords(ctx context.Context, packageID string, records []delivery.RejectedRecord) error {
+	m.rejected = append(m.rejected, records...)
+	return nil
 }
 
 func (m *mockDLQRepo) MoveToDLQ(ctx context.Context, pkg db.Package, errorCode string, errMsg string) error {
@@ -48,11 +54,12 @@ func (m *mockDLQRepo) MoveToDLQ(ctx context.Context, pkg db.Package, errorCode s
 }
 
 type mockSender struct {
-	err error
+	err    error
+	result delivery.SendResult
 }
 
-func (m *mockSender) Send(ctx context.Context, config delivery.TargetConfig, idempotencyKey string, payload []byte) error {
-	return m.err
+func (m *mockSender) Send(ctx context.Context, config delivery.TargetConfig, idempotencyKey string, payload []byte) (delivery.SendResult, error) {
+	return m.result, m.err
 }
 
 func TestRetryEngine_Success(t *testing.T) {
@@ -63,12 +70,12 @@ func TestRetryEngine_Success(t *testing.T) {
 	sender := &mockSender{err: nil}
 	pkg := db.Package{ID: "pkg-1", Payload: []byte(`{}`), IdempotencyKey: "idem-1"}
 
-	outcome, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
+	res, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome != engine.OutcomeDelivered {
-		t.Errorf("expected OutcomeDelivered, got %d", outcome)
+	if res.Outcome != engine.OutcomeDelivered {
+		t.Errorf("expected OutcomeDelivered, got %d", res.Outcome)
 	}
 	if pkgRepo.deliveredID != "pkg-1" {
 		t.Errorf("expected deliveredID 'pkg-1', got '%s'", pkgRepo.deliveredID)
@@ -86,12 +93,12 @@ func TestRetryEngine_TransientError(t *testing.T) {
 	}
 	pkg := db.Package{ID: "pkg-2", RetryCount: 1} // 1 retry already
 
-	outcome, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
+	res, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
 	if err == nil {
 		t.Fatalf("expected error due to transient failure, got nil")
 	}
-	if outcome != engine.OutcomeRetry {
-		t.Errorf("expected OutcomeRetry, got %d", outcome)
+	if res.Outcome != engine.OutcomeRetry {
+		t.Errorf("expected OutcomeRetry, got %d", res.Outcome)
 	}
 
 	if pkgRepo.failedID != "pkg-2" {
@@ -118,12 +125,12 @@ func TestRetryEngine_FatalError(t *testing.T) {
 	}
 	pkg := db.Package{ID: "pkg-3", Payload: []byte(`bad payload`)}
 
-	outcome, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
+	res, err := eng.ProcessPackage(context.Background(), pkg, sender, delivery.TargetConfig{})
 	if err == nil {
 		t.Fatalf("expected error due to fatal failure, got nil")
 	}
-	if outcome != engine.OutcomeDLQ {
-		t.Errorf("expected OutcomeDLQ, got %d", outcome)
+	if res.Outcome != engine.OutcomeDLQ {
+		t.Errorf("expected OutcomeDLQ, got %d", res.Outcome)
 	}
 
 	if dlqRepo.pkg.ID != "pkg-3" {
@@ -171,12 +178,12 @@ func TestRetryEngine_InterruptedByShutdown(t *testing.T) {
 	}
 	pkg := db.Package{ID: "pkg-5"}
 
-	outcome, err := eng.ProcessPackage(ctx, pkg, sender, delivery.TargetConfig{})
+	res, err := eng.ProcessPackage(ctx, pkg, sender, delivery.TargetConfig{})
 	if err == nil {
 		t.Fatalf("expected error due to interruption, got nil")
 	}
-	if outcome != engine.OutcomeInterrupted {
-		t.Errorf("expected OutcomeInterrupted, got %d", outcome)
+	if res.Outcome != engine.OutcomeInterrupted {
+		t.Errorf("expected OutcomeInterrupted, got %d", res.Outcome)
 	}
 	if pkgRepo.failedID != "" || dlqRepo.pkg.ID != "" {
 		t.Errorf("interrupted package must not be marked failed or moved to DLQ")
@@ -191,11 +198,60 @@ func TestRetryEngine_DeliveredPersistedAfterCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	outcome, err := eng.ProcessPackage(ctx, db.Package{ID: "pkg-6"}, &mockSender{}, delivery.TargetConfig{})
-	if err != nil || outcome != engine.OutcomeDelivered {
-		t.Fatalf("expected OutcomeDelivered without error, got %d / %v", outcome, err)
+	res, err := eng.ProcessPackage(ctx, db.Package{ID: "pkg-6"}, &mockSender{}, delivery.TargetConfig{})
+	if err != nil || res.Outcome != engine.OutcomeDelivered {
+		t.Fatalf("expected OutcomeDelivered without error, got %d / %v", res.Outcome, err)
 	}
 	if pkgRepo.deliveredID != "pkg-6" {
 		t.Errorf("expected delivered status to be persisted despite cancelled context")
+	}
+}
+
+func TestRetryEngine_RetryAfterExtendsBackoff(t *testing.T) {
+	pkgRepo := &mockPackageRepo{}
+	eng := engine.NewRetryEngine(pkgRepo, &mockDLQRepo{}, 3)
+
+	sender := &mockSender{
+		err: &delivery.DeliveryError{IsTransient: true, HTTPCode: 429, ErrorCode: "HTTP_429", RetryAfter: 120 * time.Second},
+	}
+	if _, err := eng.ProcessPackage(context.Background(), db.Package{ID: "pkg-7"}, sender, delivery.TargetConfig{}); err == nil {
+		t.Fatalf("expected transient error")
+	}
+	if diff := time.Until(pkgRepo.nextRetryAt); diff < 119*time.Second || diff > 121*time.Second {
+		t.Errorf("expected next retry in about 120 seconds, got %v", diff)
+	}
+}
+
+func TestRetryEngine_AbortLeavesPackageUntouched(t *testing.T) {
+	pkgRepo := &mockPackageRepo{}
+	dlqRepo := &mockDLQRepo{}
+	eng := engine.NewRetryEngine(pkgRepo, dlqRepo, 3)
+
+	sender := &mockSender{
+		err: &delivery.DeliveryError{ErrorCode: "AUTH_FAIL", ErrorMessage: "refresh token failed", Abort: true},
+	}
+	res, err := eng.ProcessPackage(context.Background(), db.Package{ID: "pkg-8"}, sender, delivery.TargetConfig{})
+	if err == nil || res.Outcome != engine.OutcomeAbort {
+		t.Fatalf("expected OutcomeAbort with error, got %d / %v", res.Outcome, err)
+	}
+	if pkgRepo.failedID != "" || pkgRepo.deliveredID != "" || dlqRepo.pkg.ID != "" {
+		t.Errorf("aborted package must not be updated or moved to DLQ")
+	}
+}
+
+func TestRetryEngine_RejectedRecordsGoToDLQ(t *testing.T) {
+	pkgRepo := &mockPackageRepo{}
+	dlqRepo := &mockDLQRepo{}
+	eng := engine.NewRetryEngine(pkgRepo, dlqRepo, 3)
+
+	sender := &mockSender{result: delivery.SendResult{Rejected: []delivery.RejectedRecord{
+		{Index: 1, Payload: []byte(`{"ssn":"x"}`), ErrorCode: "DECRYPT_FAIL"},
+	}}}
+	res, err := eng.ProcessPackage(context.Background(), db.Package{ID: "pkg-9"}, sender, delivery.TargetConfig{})
+	if err != nil || res.Outcome != engine.OutcomeDelivered || res.RejectedRecords != 1 {
+		t.Fatalf("expected delivered with 1 rejected record, got %+v / %v", res, err)
+	}
+	if len(dlqRepo.rejected) != 1 || pkgRepo.deliveredID != "pkg-9" {
+		t.Errorf("expected rejected record in DLQ and package delivered")
 	}
 }

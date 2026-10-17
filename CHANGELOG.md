@@ -1,5 +1,29 @@
 # Changelog - MitM Cority Delivery Layer
 
+## [v0.22.0] - 2026-10-17
+
+Follow-up hardening ([#4](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/4)).
+
+### Added
+
+- **Per-Record Decryption Guard**: Records with an undecryptable field are never sent; they are stored individually (still encrypted) in the DLQ while the rest of the package is delivered. Envelope objects are decrypted even if the field is not marked as encrypted in the mapping.
+- **Job Limits**: `max_consecutive_errors` (default 5, exit code 1) and `max_runtime_minutes` (graceful stop, status `timeout`).
+- **In-Run Retries**: `max_retry_wait_seconds` (default 300) waits for retries due soon instead of leaving them for the next run.
+- **Retry-After**: honoured for 429/5xx responses (rescheduling and upload pause, max 1 h).
+
+### Changed
+
+- **AUTH_FAIL** aborts the job with exit code 1 instead of moving packages to the DLQ; the package keeps its retry count.
+- **Secrets**: `MASTER_KEY` and DB config from IPC are kept in variables only (no `os.Setenv`).
+- **IPC**: one persistent socket connection per run with reconnect.
+- **Advisory Lock**: 64-bit key `hashtextextended('delivery_' || topic, 0)` instead of `crc32`. Avoid overlapping v0.21/v0.22 runs during deployment.
+- The dispatcher processes one claimed batch completely before claiming the next one.
+- Exit code 2 also covers withheld records moved to the DLQ.
+
+### Fixed
+
+- A failing encrypted-field lookup is fatal instead of silently sending encrypted values.
+
 ## [v0.21.0] - 2026-10-17
 
 Hardening of the Cority delivery job ([#2](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/2)).

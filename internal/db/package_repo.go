@@ -7,7 +7,7 @@
  *
  * @file package_repo.go
  * @brief Packaging of target fragments and package state transitions
- * @version 0.21.0
+ * @version 0.22.0
  * @date 2026-10-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -145,6 +145,19 @@ func (r *PackageRepo) PackageTargetFragments(ctx context.Context, topic string, 
 	}
 
 	return len(fragmentIDs), failedIDs, tx.Commit(ctx)
+}
+
+// NextRetryAt returns the earliest next_retry_at of the topic's failed packages (ok = false if none).
+func (r *PackageRepo) NextRetryAt(ctx context.Context, topic string) (time.Time, bool, error) {
+	var next *time.Time
+	err := r.pool.QueryRow(ctx, `SELECT MIN(next_retry_at) FROM packages WHERE topic = $1 AND status = 'failed'`, topic).Scan(&next)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("failed to query next retry: %w", err)
+	}
+	if next == nil {
+		return time.Time{}, false, nil
+	}
+	return *next, true, nil
 }
 
 // ResetSending returns all packages of a topic that are stuck in 'sending' to 'pending'.

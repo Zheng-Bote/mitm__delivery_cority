@@ -7,7 +7,7 @@
  *
  * @file cority_adapter_test.go
  * @brief Unit tests for the Cority adapter using an httptest server and an in-memory token store
- * @version 0.21.0
+ * @version 0.22.0
  * @date 2026-10-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -152,7 +152,7 @@ func TestLoginBodyEscapesCredentials(t *testing.T) {
 	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
 	target := corityTarget(t, srv.URL, map[string]interface{}{"login_pass": pass})
 
-	if err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`)); err != nil {
+	if _, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -184,7 +184,7 @@ func TestUnauthorizedTriggersSingleReauthentication(t *testing.T) {
 	hash := connectionHashFor(srv.URL, cfg.LoginUser)
 	store.tokens[hash] = &CachedToken{AccessToken: "stale", AccessExpiry: time.Now().Add(time.Hour)}
 
-	if err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`)); err != nil {
+	if _, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`)); err != nil {
 		t.Fatalf("expected success after re-authentication, got %v", err)
 	}
 	if fake.logins != 1 {
@@ -208,7 +208,7 @@ func TestRepeatedUnauthorizedIsTransient(t *testing.T) {
 
 	// access-1 is issued by the first login and rejected; the retry login issues access-2.
 	fake.rejectTokens["access-2"] = true
-	err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
+	_, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
 
 	var delErr *DeliveryError
 	if !errors.As(err, &delErr) || !delErr.IsTransient || delErr.ErrorCode != "HTTP_401" {
@@ -231,7 +231,7 @@ func TestRecordsAreChunkedByUploadBatchSize(t *testing.T) {
 
 	payload := []byte(`[{"n":1},{"n":2},{"n":3},{"n":4},{"n":5}]`)
 	key := "11111111-1111-1111-1111-111111111111"
-	if err := adapter.Send(context.Background(), target, key, payload); err != nil {
+	if _, err := adapter.Send(context.Background(), target, key, payload); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -295,7 +295,7 @@ func TestEncryptedFieldIsDecrypted(t *testing.T) {
 	target.KEK, target.WrappedKey, target.EncryptedFields = kek, wrapped, []string{"ssn"}
 
 	payload, _ := json.Marshal([]map[string]string{{"ssn": encoded}})
-	if err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload); err != nil {
+	if _, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	record := fake.imports[0]["records"].([]interface{})[0].(map[string]interface{})
@@ -304,12 +304,21 @@ func TestEncryptedFieldIsDecrypted(t *testing.T) {
 	}
 }
 
-func TestUndecryptableFieldFailsPackage(t *testing.T) {
+// envelopeValue encrypts a JSON value with the given keys in legacy string format.
+func envelopeValue(t *testing.T, kek, wrapped []byte, plaintext string) string {
+	t.Helper()
+	ciphertext, nonce, err := crypto.EnvelopeEncrypt(kek, wrapped, []byte(plaintext))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(append(nonce, ciphertext...))
+}
+
+func TestUndecryptableRecordIsWithheld(t *testing.T) {
 	kek := []byte("0123456789abcdef0123456789abcdef")
 	otherKEK := []byte("fedcba9876543210fedcba9876543210")
-	wrapped, _ := crypto.GenerateWrappedDEK(otherKEK)
-	ciphertext, nonce, _ := crypto.EnvelopeEncrypt(otherKEK, wrapped, []byte(`"secret"`))
-	encoded := base64.StdEncoding.EncodeToString(append(nonce, ciphertext...))
+	wrapped, _ := crypto.GenerateWrappedDEK(kek)
+	otherWrapped, _ := crypto.GenerateWrappedDEK(otherKEK)
 
 	fake := &fakeCority{}
 	srv := httptest.NewServer(fake.handler())
@@ -317,20 +326,168 @@ func TestUndecryptableFieldFailsPackage(t *testing.T) {
 
 	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
 	target := corityTarget(t, srv.URL, nil)
-	// Wrong KEK for this wrapped DEK
 	target.KEK, target.WrappedKey, target.EncryptedFields = kek, wrapped, []string{"ssn"}
 
-	for _, value := range []string{encoded, "not base64 !!"} {
-		payload, _ := json.Marshal([]map[string]string{{"ssn": value}})
-		err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload)
+	payload, _ := json.Marshal([]map[string]string{
+		{"name": "ok", "ssn": envelopeValue(t, kek, wrapped, `"111"`)},
+		{"name": "wrong-key", "ssn": envelopeValue(t, otherKEK, otherWrapped, `"222"`)},
+		{"name": "not-base64", "ssn": "not base64 !!"},
+	})
+	res, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
-		var delErr *DeliveryError
-		if !errors.As(err, &delErr) || delErr.IsTransient || delErr.ErrorCode != "DECRYPT_FAIL" {
-			t.Errorf("value %q: expected fatal DECRYPT_FAIL, got %v", value, err)
+	if len(res.Rejected) != 2 || res.Rejected[0].Index != 1 || res.Rejected[1].Index != 2 {
+		t.Fatalf("expected records #1 and #2 rejected, got %+v", res.Rejected)
+	}
+	for _, r := range res.Rejected {
+		if r.ErrorCode != "DECRYPT_FAIL" {
+			t.Errorf("expected DECRYPT_FAIL, got %s", r.ErrorCode)
+		}
+		var orig map[string]string
+		json.Unmarshal(r.Payload, &orig)
+		if orig["ssn"] == "222" {
+			t.Errorf("rejected payload must keep the original encrypted value")
 		}
 	}
+
+	records := fake.imports[0]["records"].([]interface{})
+	if len(records) != 1 || records[0].(map[string]interface{})["ssn"] != "111" {
+		t.Errorf("expected only the decryptable record to be sent, got %v", records)
+	}
+}
+
+func TestAllRecordsWithheldSendsNothing(t *testing.T) {
+	fake := &fakeCority{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	target := corityTarget(t, srv.URL, nil)
+	target.KEK, target.EncryptedFields = []byte("0123456789abcdef0123456789abcdef"), []string{"ssn"}
+
+	res, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"ssn":"not base64 !!"}]`))
+	if err != nil || len(res.Rejected) != 1 {
+		t.Fatalf("expected 1 rejected record without error, got %+v / %v", res, err)
+	}
 	if len(fake.imports) != 0 {
-		t.Errorf("no records must be uploaded when decryption fails")
+		t.Errorf("no import request expected when all records are withheld")
+	}
+}
+
+func TestEnvelopeObjectDecryptedWithoutMapping(t *testing.T) {
+	kek := []byte("0123456789abcdef0123456789abcdef")
+	wrapped, _ := crypto.GenerateWrappedDEK(kek)
+	ciphertext, nonce, _ := crypto.EnvelopeEncrypt(kek, wrapped, []byte(`"secret"`))
+
+	fake := &fakeCority{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	target := corityTarget(t, srv.URL, nil)
+	target.KEK, target.WrappedKey = kek, wrapped // no EncryptedFields configured
+
+	payload, _ := json.Marshal([]map[string]interface{}{{"pin": map[string]string{
+		"ciphertext": base64.StdEncoding.EncodeToString(ciphertext),
+		"nonce":      base64.StdEncoding.EncodeToString(nonce),
+	}}})
+	res, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload)
+	if err != nil || len(res.Rejected) != 0 {
+		t.Fatalf("unexpected result: %+v / %v", res, err)
+	}
+	record := fake.imports[0]["records"].([]interface{})[0].(map[string]interface{})
+	if record["pin"] != "secret" {
+		t.Errorf("expected decrypted envelope object, got %v", record["pin"])
+	}
+}
+
+func TestListedEnvelopeObjectIsDecryptedOnce(t *testing.T) {
+	kek := []byte("0123456789abcdef0123456789abcdef")
+	wrapped, _ := crypto.GenerateWrappedDEK(kek)
+	ciphertext, nonce, _ := crypto.EnvelopeEncrypt(kek, wrapped, []byte(`"537732"`))
+
+	fake := &fakeCority{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	target := corityTarget(t, srv.URL, nil)
+	target.KEK, target.WrappedKey, target.EncryptedFields = kek, wrapped, []string{"ssn"}
+
+	payload, _ := json.Marshal([]map[string]interface{}{{"ssn": map[string]string{
+		"ciphertext": base64.StdEncoding.EncodeToString(ciphertext),
+		"nonce":      base64.StdEncoding.EncodeToString(nonce),
+	}}})
+	res, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", payload)
+	if err != nil || len(res.Rejected) != 0 {
+		t.Fatalf("decrypted value must not be decrypted a second time: %+v / %v", res, err)
+	}
+	record := fake.imports[0]["records"].([]interface{})[0].(map[string]interface{})
+	if record["ssn"] != "537732" {
+		t.Errorf("expected 537732, got %v", record["ssn"])
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	cases := map[string]time.Duration{
+		"":                              0,
+		"120":                           120 * time.Second,
+		"-5":                            0,
+		"99999":                         time.Hour,
+		"Sat, 17 Oct 2026 12:02:00 GMT": 2 * time.Minute,
+		"garbage":                       0,
+	}
+	for in, want := range cases {
+		if got := parseRetryAfter(in, now); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestRetryAfterPausesNextUpload(t *testing.T) {
+	fake := &fakeCority{}
+	mux := http.NewServeMux()
+	mux.Handle("/api/", fake.handler())
+	mux.HandleFunc("/api/employeeimport", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	target := corityTarget(t, srv.URL, nil)
+
+	_, err := adapter.Send(context.Background(), target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || !delErr.IsTransient || delErr.RetryAfter != 120*time.Second {
+		t.Fatalf("expected transient error with RetryAfter 120s, got %v", err)
+	}
+
+	// The next upload must wait for the pause; a short context proves it does not send immediately.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = adapter.Send(ctx, target, "11111111-1111-1111-1111-111111111112", []byte(`[{"a":"1"}]`))
+	if !errors.As(err, &delErr) || delErr.ErrorCode != "CANCELLED" {
+		t.Errorf("expected the paused upload to be cancelled, got %v", err)
+	}
+}
+
+func TestAuthFailAbortsJob(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	_, err := adapter.Send(context.Background(), corityTarget(t, srv.URL, nil), "11111111-1111-1111-1111-111111111111", []byte(`[]`))
+
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || delErr.ErrorCode != "AUTH_FAIL" || !delErr.Abort {
+		t.Fatalf("expected AUTH_FAIL with Abort, got %v", err)
 	}
 }
 
@@ -347,7 +504,7 @@ func TestSlowdownAbortsOnCancel(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	err := adapter.Send(ctx, target, "11111111-1111-1111-1111-111111111111", []byte(`[]`))
+	_, err := adapter.Send(ctx, target, "11111111-1111-1111-1111-111111111111", []byte(`[]`))
 	if err == nil {
 		t.Fatalf("expected error after cancellation")
 	}

@@ -7,7 +7,7 @@
  *
  * @file main.go
  * @brief Entry point: packages target fragments and delivers them to Cority SaaS
- * @version 0.21.0
+ * @version 0.22.0
  * @date 2026-10-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -21,8 +21,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"hash/crc32"
 	"log"
 	"net"
 	"net/url"
@@ -47,7 +47,7 @@ import (
 var (
 	appName        = "Delivery Engine"
 	appDescription = "Delivers packaged data to target systems"
-	version        = "0.21.0"
+	version        = "0.22.0"
 )
 
 type JobArgs struct {
@@ -59,11 +59,29 @@ type JobArgs struct {
 	BlockingJobs []string `json:"blocking_jobs"`
 	// BlockingMaxRuntimeMinutes ignores blocking runs started longer ago (0 = no limit).
 	BlockingMaxRuntimeMinutes int `json:"blocking_max_runtime_minutes"`
+	// MaxConsecutiveErrors aborts the job after this many failed claim attempts in a row (default 5).
+	MaxConsecutiveErrors int `json:"max_consecutive_errors"`
+	// MaxRuntimeMinutes stops the job gracefully after this time (0 = no limit).
+	MaxRuntimeMinutes int `json:"max_runtime_minutes"`
+	// MaxRetryWaitSeconds waits in-run for retries due within this time (0 = default 300, negative = off).
+	MaxRetryWaitSeconds int `json:"max_retry_wait_seconds"`
 }
 
 // deliveryStats counts package outcomes across workers.
 type deliveryStats struct {
-	delivered, retry, dlq, interrupted, errors atomic.Int64
+	delivered, retry, dlq, interrupted, errors, rejected atomic.Int64
+}
+
+// sleepCtx sleeps for d and returns false if ctx was cancelled meanwhile.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // buildConnString builds a PostgreSQL URL with URL-escaped credentials.
@@ -86,13 +104,18 @@ func getEnv(key, fallback string) string {
 }
 
 func main() {
+	// Secrets are kept in variables only (never written to the process environment).
+	// ENV values are the fallback for standalone execution.
+	dbConfigJSON := os.Getenv("MITM_DB_CONFIG_JSON")
+	masterKey := os.Getenv("MASTER_KEY")
+
 	// Fetch credentials via IPC if running under scheduler
-	if dbCfg, masterKey, err := fetchCredentialsFromScheduler(); err == nil {
-		if dbCfg != "" {
-			os.Setenv("MITM_DB_CONFIG_JSON", dbCfg)
+	if ipcDBCfg, ipcMasterKey, err := fetchCredentialsFromScheduler(); err == nil {
+		if ipcDBCfg != "" {
+			dbConfigJSON = ipcDBCfg
 		}
-		if masterKey != "" {
-			os.Setenv("MASTER_KEY", masterKey)
+		if ipcMasterKey != "" {
+			masterKey = ipcMasterKey
 		}
 	} else if os.Getenv("RUN_ID") != "" && os.Getenv("SCHEDULER_SOCKET_PATH") != "" {
 		log.Printf("[IPC Warning] Failed to get credentials from scheduler: %v", err)
@@ -122,6 +145,12 @@ func main() {
 	if jobArgs.SourceName == "" {
 		jobArgs.SourceName = "DELIVERY"
 	}
+	if jobArgs.MaxConsecutiveErrors <= 0 {
+		jobArgs.MaxConsecutiveErrors = 5
+	}
+	if jobArgs.MaxRetryWaitSeconds == 0 {
+		jobArgs.MaxRetryWaitSeconds = 300
+	}
 
 	// 2. Database Connection Setup
 	configSource := "Environment Variables"
@@ -131,7 +160,8 @@ func main() {
 	dbPass := ""
 	dbName := ""
 
-	jsonConfig := os.Getenv("MITM_DB_CONFIG_JSON")
+	sslModeSetting := os.Getenv("MITM_DB_SSLMODE")
+	jsonConfig := dbConfigJSON
 	if jsonConfig != "" {
 		var fullCfg struct {
 			DB struct {
@@ -152,9 +182,9 @@ func main() {
 		dbPass = fullCfg.DB.Password
 		dbName = fullCfg.DB.Database
 		if fullCfg.DB.SSLMode {
-			os.Setenv("MITM_DB_SSLMODE", "require")
+			sslModeSetting = "require"
 		} else {
-			os.Setenv("MITM_DB_SSLMODE", "disable")
+			sslModeSetting = "disable"
 		}
 		configSource = "JSON Config (MITM_DB_CONFIG_JSON)"
 	} else {
@@ -166,14 +196,13 @@ func main() {
 	}
 
 	sslMode := "disable"
-	envSSLMode := os.Getenv("MITM_DB_SSLMODE")
-	if envSSLMode != "" {
-		if envSSLMode == "true" {
+	if sslModeSetting != "" {
+		if sslModeSetting == "true" {
 			sslMode = "require"
-		} else if envSSLMode == "false" {
+		} else if sslModeSetting == "false" {
 			sslMode = "disable"
 		} else {
-			sslMode = envSSLMode
+			sslMode = sslModeSetting
 		}
 	}
 	connString := buildConnString(dbUser, dbPass, dbHost, dbPort, dbName, sslMode)
@@ -199,17 +228,16 @@ func main() {
 	}
 	defer lockConn.Release()
 
-	// Hash topic to 32-bit integer for lock ID
-	importHash := crc32.ChecksumIEEE([]byte("delivery_" + jobArgs.Topic))
-	lockID := int32(importHash)
+	// 64-bit lock key derived from the topic (avoids 32-bit hash collisions between topics)
+	lockName := "delivery_" + jobArgs.Topic
 
 	var locked bool
-	err = lockConn.QueryRow(context.Background(), "SELECT pg_try_advisory_lock($1)", lockID).Scan(&locked)
+	err = lockConn.QueryRow(context.Background(), "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lockName).Scan(&locked)
 	if err != nil {
 		log.Fatalf("Failed to execute pg_try_advisory_lock: %v", err)
 	}
 	if !locked {
-		log.Printf("Another delivery instance for topic '%s' is already running (Advisory Lock %d). Exiting gracefully.", jobArgs.Topic, lockID)
+		log.Printf("Another delivery instance for topic '%s' is already running (Advisory Lock '%s'). Exiting gracefully.", jobArgs.Topic, lockName)
 		os.Exit(0)
 	}
 
@@ -238,6 +266,7 @@ func main() {
 		ipcClient.SendAudit(fmt.Sprintf("%s (%s) started", appName, version))
 		ipcClient.SendAudit(fmt.Sprintf("Loaded database configuration from %s", configSource))
 	}
+	defer ipcClient.Close()
 
 	// Helper for audit logging
 	logAudit := func(msg string) {
@@ -291,7 +320,7 @@ func main() {
 	}
 
 	// Fetch target config dynamically
-	targetConfig, err := targetRepo.GetDeliveryTarget(context.Background(), jobArgs.Topic)
+	targetConfig, err := targetRepo.GetDeliveryTarget(context.Background(), jobArgs.Topic, masterKey)
 	if err != nil {
 		fatalf("Failed to fetch delivery target config for topic '%s': %v", jobArgs.Topic, err)
 	}
@@ -310,9 +339,22 @@ func main() {
 		jobArgs.Workers = 1
 	}
 
-	// Context for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
+	// Context for graceful shutdown (signals, job abort) and the optional max runtime
+	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ctx := baseCtx
+	if jobArgs.MaxRuntimeMinutes > 0 {
+		var cancelRuntime context.CancelFunc
+		ctx, cancelRuntime = context.WithTimeout(baseCtx, time.Duration(jobArgs.MaxRuntimeMinutes)*time.Minute)
+		defer cancelRuntime()
+	}
+
+	// abortJob stops all processing after a job-level failure (e.g. authentication)
+	var aborted atomic.Bool
+	abortJob := func() {
+		aborted.Store(true)
+		cancel()
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -330,12 +372,13 @@ func main() {
 	// 5. Worker Pool Setup
 	jobs := make(chan db.Package, jobArgs.BatchSize)
 	var wg sync.WaitGroup
+	var batch sync.WaitGroup // tracks the packages of the current dispatcher batch
 	var stats deliveryStats
 
 	// Start workers
 	for i := 0; i < jobArgs.Workers; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, jobs, retryEngine, sender, *targetConfig, logAudit, &stats)
+		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, logAudit, &stats, abortJob)
 	}
 
 	// 6. Packager: Create delivery packages from target_fragments
@@ -356,7 +399,26 @@ func main() {
 		}
 	}
 
-	// 7. Dispatcher Loop
+	// 7. Dispatcher Loop: claim a batch, wait until it is processed, then claim the next one
+	maxRetryWait := time.Duration(jobArgs.MaxRetryWaitSeconds) * time.Second
+	consecutiveErrors := 0
+	claimFailed := false
+	// handleDBError counts a failed DB attempt and backs off; it returns false when the job must stop.
+	handleDBError := func(what string, err error) bool {
+		if ctx.Err() != nil {
+			return false
+		}
+		consecutiveErrors++
+		log.Printf("Error %s (%d/%d): %v", what, consecutiveErrors, jobArgs.MaxConsecutiveErrors, err)
+		if consecutiveErrors >= jobArgs.MaxConsecutiveErrors {
+			logAudit(fmt.Sprintf("Aborting: %s failed %d times in a row: %v", what, consecutiveErrors, err))
+			claimFailed = true
+			return false
+		}
+		backoff := min(time.Duration(1<<consecutiveErrors)*time.Second, 30*time.Second)
+		return sleepCtx(ctx, backoff)
+	}
+
 dispatcherLoop:
 	for {
 		if ctx.Err() != nil {
@@ -365,24 +427,48 @@ dispatcherLoop:
 
 		packages, err := pkgRepo.ClaimPendingPackages(ctx, jobArgs.Topic, jobArgs.BatchSize)
 		if err != nil {
-			log.Printf("Error claiming packages: %v", err)
-			time.Sleep(2 * time.Second)
+			if !handleDBError("claiming packages", err) {
+				break dispatcherLoop
+			}
 			continue
 		}
+		consecutiveErrors = 0
 
 		if len(packages) == 0 {
+			// Wait in-run for retries that become due soon
+			if maxRetryWait > 0 {
+				next, ok, err := pkgRepo.NextRetryAt(ctx, jobArgs.Topic)
+				if err != nil {
+					if !handleDBError("checking pending retries", err) {
+						break dispatcherLoop
+					}
+					continue
+				}
+				if wait := time.Until(next); ok && wait <= maxRetryWait {
+					// At least 1s, so that clock skew to the DB cannot cause a busy loop
+					wait = max(wait, time.Second)
+					log.Printf("Waiting %v for packages scheduled for retry...", wait.Round(time.Second))
+					if !sleepCtx(ctx, wait) {
+						break dispatcherLoop
+					}
+					continue
+				}
+			}
 			log.Println("No more packages to deliver. Batch job complete.")
 			break dispatcherLoop
 		}
 
 		log.Printf("Claimed batch of %d packages", len(packages))
 		for _, p := range packages {
+			batch.Add(1)
 			select {
 			case jobs <- p:
 			case <-ctx.Done():
+				batch.Done()
 				break dispatcherLoop
 			}
 		}
+		batch.Wait()
 	}
 
 	close(jobs)
@@ -395,16 +481,21 @@ dispatcherLoop:
 		logAudit(fmt.Sprintf("Reset %d unprocessed packages from 'sending' to 'pending'", n))
 	}
 
-	summary := fmt.Sprintf("Topic %s: %d delivered, %d scheduled for retry, %d moved to DLQ, %d interrupted, %d state errors",
-		jobArgs.Topic, stats.delivered.Load(), stats.retry.Load(), stats.dlq.Load(), stats.interrupted.Load(), stats.errors.Load())
+	summary := fmt.Sprintf("Topic %s: %d delivered, %d scheduled for retry, %d moved to DLQ, %d records withheld (DLQ), %d interrupted, %d state errors",
+		jobArgs.Topic, stats.delivered.Load(), stats.retry.Load(), stats.dlq.Load(), stats.rejected.Load(), stats.interrupted.Load(), stats.errors.Load())
 	logAudit(summary)
 
 	status, exitCode := "finished", 0
-	if ctx.Err() != nil {
-		status = "cancelled"
-	}
-	if stats.dlq.Load() > 0 || stats.errors.Load() > 0 {
+	switch {
+	case aborted.Load() || claimFailed:
+		status, exitCode = "failed", 1
+	case stats.dlq.Load() > 0 || stats.rejected.Load() > 0 || stats.errors.Load() > 0:
 		status, exitCode = "failed", 2
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		status = "timeout"
+		logAudit(fmt.Sprintf("Max runtime of %d minutes reached; remaining packages are left for the next run", jobArgs.MaxRuntimeMinutes))
+	case ctx.Err() != nil:
+		status = "cancelled"
 	}
 	log.Printf("Delivery Batch Job %s. %s", status, summary)
 	if ipcClient != nil {
@@ -416,33 +507,42 @@ dispatcherLoop:
 	}
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats) {
+func worker(ctx context.Context, wg *sync.WaitGroup, batch *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, abortJob func()) {
 	defer wg.Done()
 	for pkg := range jobs {
-		if ctx.Err() != nil {
-			// Shutdown: leave the package in 'sending'; it is reset to 'pending' after all workers stopped.
-			stats.interrupted.Add(1)
-			continue
-		}
-		outcome, err := retryEngine.ProcessPackage(ctx, pkg, sender, config)
-		switch outcome {
-		case engine.OutcomeDelivered:
-			stats.delivered.Add(1)
-		case engine.OutcomeRetry:
-			stats.retry.Add(1)
-		case engine.OutcomeDLQ:
-			stats.dlq.Add(1)
-		case engine.OutcomeInterrupted:
-			stats.interrupted.Add(1)
-		default:
-			stats.errors.Add(1)
-		}
-		if err != nil {
-			log.Printf("Failed to process package %s: %v", pkg.ID, err)
-			logAudit(fmt.Sprintf("Package %s failed: %v", pkg.ID, err))
-		} else {
-			logAudit(fmt.Sprintf("Package %s delivered successfully", pkg.ID))
-		}
+		processPackage(ctx, pkg, retryEngine, sender, config, logAudit, stats, abortJob)
+		batch.Done()
+	}
+}
+
+func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, abortJob func()) {
+	if ctx.Err() != nil {
+		// Shutdown: leave the package in 'sending'; it is reset to 'pending' after all workers stopped.
+		stats.interrupted.Add(1)
+		return
+	}
+	res, err := retryEngine.ProcessPackage(ctx, pkg, sender, config)
+	stats.rejected.Add(int64(res.RejectedRecords))
+	switch res.Outcome {
+	case engine.OutcomeAbort:
+		logAudit(fmt.Sprintf("Aborting job: %v", err))
+		abortJob()
+	case engine.OutcomeDelivered:
+		stats.delivered.Add(1)
+	case engine.OutcomeRetry:
+		stats.retry.Add(1)
+	case engine.OutcomeDLQ:
+		stats.dlq.Add(1)
+	case engine.OutcomeInterrupted:
+		stats.interrupted.Add(1)
+	default:
+		stats.errors.Add(1)
+	}
+	if err != nil {
+		log.Printf("Failed to process package %s: %v", pkg.ID, err)
+		logAudit(fmt.Sprintf("Package %s failed: %v", pkg.ID, err))
+	} else {
+		logAudit(fmt.Sprintf("Package %s delivered successfully", pkg.ID))
 	}
 }
 
