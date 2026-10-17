@@ -7,7 +7,7 @@
  *
  * @file target_repo.go
  * @brief Loads and decrypts the delivery target configuration of a topic
- * @version 0.21.0
+ * @version 0.22.0
  * @date 2026-10-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -21,7 +21,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
 
 	"mitm_cority/internal/crypto"
 	"mitm_cority/internal/delivery"
@@ -37,8 +36,9 @@ func NewTargetRepo(pool *pgxpool.Pool) *TargetRepo {
 	return &TargetRepo{Pool: pool}
 }
 
-// GetDeliveryTarget fetches and decrypts the target config for a given topic
-func (r *TargetRepo) GetDeliveryTarget(ctx context.Context, topic string) (*delivery.TargetConfig, error) {
+// GetDeliveryTarget fetches and decrypts the target config for a given topic.
+// masterKey is the KEK (base64 or raw), obtained via IPC or ENV by the caller.
+func (r *TargetRepo) GetDeliveryTarget(ctx context.Context, topic string, masterKey string) (*delivery.TargetConfig, error) {
 	query := `
 		SELECT 
 			dt.adapter_type, dt.endpoint_url, dt.config_payload, dt.nonce, sk.wrapped_key
@@ -55,12 +55,11 @@ func (r *TargetRepo) GetDeliveryTarget(ctx context.Context, topic string) (*deli
 		return nil, fmt.Errorf("failed to fetch target for topic %s: %w", topic, err)
 	}
 
-	masterKeyStr := os.Getenv("MASTER_KEY")
 	var kek []byte
-	if decoded, err := base64.StdEncoding.DecodeString(masterKeyStr); err == nil {
+	if decoded, err := base64.StdEncoding.DecodeString(masterKey); err == nil {
 		kek = decoded
 	} else {
-		kek = []byte(masterKeyStr)
+		kek = []byte(masterKey)
 	}
 	if len(kek) != 32 {
 		return nil, fmt.Errorf("MASTER_KEY must be 32 bytes (AES-256), got %d bytes", len(kek))
@@ -79,19 +78,23 @@ func (r *TargetRepo) GetDeliveryTarget(ctx context.Context, topic string) (*deli
 		JOIN mapping_source ms ON mr.source_id = ms.id
 		WHERE LOWER(ms.topic) = LOWER($1) AND mtf.encrypted = true
 	`
+	// Without the list, encrypted values could be sent unnoticed, so any failure is fatal.
 	rows, err := r.Pool.Query(ctx, fieldsQuery, topic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load encrypted fields for topic %s: %w", topic, err)
+	}
 	var encryptedFields []string
-	if err == nil {
-		for rows.Next() {
-			var fieldName string
-			if err := rows.Scan(&fieldName); err == nil {
-				encryptedFields = append(encryptedFields, fieldName)
-			}
+	for rows.Next() {
+		var fieldName string
+		if err := rows.Scan(&fieldName); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed to scan encrypted field for topic %s: %w", topic, err)
 		}
-		rows.Close()
-	} else {
-		// Even if err is not nil, we log it for debugging
-		fmt.Printf("Query for encrypted fields failed: %v\n", err)
+		encryptedFields = append(encryptedFields, fieldName)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to load encrypted fields for topic %s: %w", topic, err)
 	}
 
 	cfg := &delivery.TargetConfig{
