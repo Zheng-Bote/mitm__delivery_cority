@@ -48,11 +48,38 @@ ARGS_JSON='{
   "batch_size": 200,
   "max_retries": 5,
   "source_name": "DELIVERY",
-  "blocking_jobs": ["mitm_deliver_Org"]
+  "blocking_jobs": ["mitm_deliver_Org"],
+  "blocking_max_runtime_minutes": 360
 }'
 
 ./bin/mitm-cority "$ARGS_JSON"
 ```
+
+**Note:** `SCHEDULER_SOCKET_PATH` is only used together with `RUN_ID` (set by the scheduler). Without `RUN_ID`, the job falls back to the environment variables and sends no IPC events.
+
+#### Job Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `topic` | – | Topic to deliver; selects the `delivery_targets` row. |
+| `workers` | `5` | Always forced to `1` for `CORITY_SAAS`. |
+| `batch_size` | `100` | Maximum number of target fragments per delivery package, and number of packages claimed per dispatcher round. |
+| `max_retries` | `5` | Transient failures are retried with a backoff of 2^n seconds. Retries that are due later are picked up by the next run. |
+| `source_name` | `DELIVERY` | Prefix for IPC status and audit messages. |
+| `blocking_jobs` | `[]` | Scheduled program names; if one of them has an unfinished `program_runs` entry, the job exits with code 0. |
+| `blocking_max_runtime_minutes` | `0` | Ignores blocking runs started longer ago than this (protects against stale runs left by crashed jobs). `0` = no limit. |
+
+#### Exit Codes & Recovery
+
+| Exit Code | Meaning |
+|---|---|
+| `0` | Finished (or exited because of a blocking job / another instance of the topic). |
+| `1` | Fatal error, e.g. invalid DB config, wrong `MASTER_KEY` (must decode to 32 bytes), undecryptable or invalid `config_payload`. No package is touched. |
+| `2` | Finished, but at least one package was moved to the DLQ or its state could not be persisted. |
+
+The final IPC status event (`finished`, `failed` or `cancelled`) carries the counts of delivered, retry-scheduled, DLQ and interrupted packages.
+Packages left in status `sending` (crash, SIGTERM) are reset to `pending` at the start and at the end of every run.
+**Note:** Jobs with `restart_on_exit = true` are restarted once by the scheduler after exit code `2`.
 
 The Delivery job will automatically connect to the database (fetching credentials via IPC if running under the scheduler), query the `delivery_targets` table for the target configuration matching the `Topic` ("Employee"), decrypt the `config_payload` using `MASTER_KEY`, and dynamically instantiate the correct adapter.
 
@@ -86,8 +113,11 @@ When configuring the Target via the Admin Frontend, the `Config Payload` JSON di
 ```
 
 **Note:** 
-- The `slowdown` parameter is optional (in seconds). If set and > 0, the adapter will wait for the specified time interval between package uploads.
-- The `timeout` parameter is optional (in seconds). If set and > 0, it overrides the default HTTP timeout (300s) for each of the three Cority API requests.
+- The `slowdown` parameter is optional (in seconds, JSON string or number). If set and > 0, the adapter will wait for the specified time interval between package uploads.
+- The `timeout` parameter is optional (in seconds, JSON string or number). If set and > 0, it overrides the default HTTP timeout (300s) for each of the three Cority API requests.
+- `upload_options.batch_size` (if > 0) splits the records of a package into several import requests of at most that size. Each chunk gets a deterministic `Idempotency-Key` derived from the package key. If a chunk fails, the whole package is retried and earlier chunks are sent again with the same keys (safe with `import_mode: upsert`).
+- If Cority rejects a cached access token (HTTP 401), the adapter invalidates it, re-authenticates once and retries the request.
+- Encrypted fields that cannot be decrypted move the package to the DLQ (`DECRYPT_FAIL`); no data is sent.
 
 The adapter uses this configuration to assemble the final payload for the target API. Specifically, the data is uploaded in the following format:
 
@@ -108,7 +138,9 @@ The adapter uses this configuration to assemble the final payload for the target
 
 The job interacts strictly with the tables predefined in `./migrations`:
 
+- `target_fragments`: Packages `PENDING` fragments; malformed JSON fragments are marked `FAILED`.
 - `packages`: Pulls pending/retryable records.
 - `dead_letter_queue`: Safely unloads fatal records.
+- `adapter_tokens`: Shared Cority token cache (row-locked with `FOR UPDATE`).
 
 Concurrency is handled natively in Postgres using `FOR UPDATE SKIP LOCKED`.

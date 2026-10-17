@@ -1,18 +1,37 @@
+/**
+ * SPDX-FileComment: Cority Delivery Batch Job
+ * SPDX-FileType: SOURCE
+ * SPDX-FileContributor: ZHENG Robert
+ * SPDX-FileCopyrightText: 2026 ZHENG Robert
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * @file main.go
+ * @brief Entry point: packages target fragments and delivers them to Cority SaaS
+ * @version 0.21.0
+ * @date 2026-10-17
+ *
+ * @author ZHENG Robert (robert@hase-zheng.net)
+ * @copyright Copyright (c) 2026 ZHENG Robert
+ * @LICENSE Apache-2.0
+ */
+
 package main
 
 import (
 	"bufio"
-	"net"
-	"strconv"
 	"context"
 	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,7 +47,7 @@ import (
 var (
 	appName        = "Delivery Engine"
 	appDescription = "Delivers packaged data to target systems"
-	version        = "0.19.3"
+	version        = "0.21.0"
 )
 
 type JobArgs struct {
@@ -38,6 +57,25 @@ type JobArgs struct {
 	MaxRetries   int      `json:"max_retries"`
 	SourceName   string   `json:"source_name"`
 	BlockingJobs []string `json:"blocking_jobs"`
+	// BlockingMaxRuntimeMinutes ignores blocking runs started longer ago (0 = no limit).
+	BlockingMaxRuntimeMinutes int `json:"blocking_max_runtime_minutes"`
+}
+
+// deliveryStats counts package outcomes across workers.
+type deliveryStats struct {
+	delivered, retry, dlq, interrupted, errors atomic.Int64
+}
+
+// buildConnString builds a PostgreSQL URL with URL-escaped credentials.
+func buildConnString(user, pass, host, port, dbName, sslMode string) string {
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(user, pass),
+		Host:     net.JoinHostPort(host, port),
+		Path:     "/" + dbName,
+		RawQuery: url.Values{"sslmode": {sslMode}}.Encode(),
+	}
+	return u.String()
 }
 
 func getEnv(key, fallback string) string {
@@ -138,7 +176,7 @@ func main() {
 			sslMode = envSSLMode
 		}
 	}
-	connString := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", dbUser, dbPass, dbHost, dbPort, dbName, sslMode)
+	connString := buildConnString(dbUser, dbPass, dbHost, dbPort, dbName, sslMode)
 	config_pool, err := pgxpool.ParseConfig(connString)
 	if err == nil {
 		config_pool.MaxConns = 20
@@ -209,19 +247,32 @@ func main() {
 		}
 	}
 
+	// Helper for fatal errors after the scheduler has been notified about the start
+	fatalf := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		log.Print(msg)
+		if ipcClient != nil {
+			ipcClient.SendEvent("failed", msg, 0)
+		}
+		os.Exit(1)
+	}
+
 	// 3b. Check for Blocking Jobs
 	if len(jobArgs.BlockingJobs) > 0 {
 		var blockingJobName string
+		var runningMinutes int
 		err := pool.QueryRow(context.Background(), `
-			SELECT sp.name 
+			SELECT sp.name, COALESCE((EXTRACT(EPOCH FROM (NOW() - pr.started_at)) / 60)::int, 0)
 			FROM program_runs pr 
 			JOIN scheduled_programs sp ON pr.program_id = sp.id 
 			WHERE sp.name = ANY($1) 
 			  AND pr.finished_at IS NULL 
-			LIMIT 1`, jobArgs.BlockingJobs).Scan(&blockingJobName)
+			  AND ($2::int = 0 OR pr.started_at > NOW() - make_interval(mins => $2::int))
+			ORDER BY pr.started_at DESC
+			LIMIT 1`, jobArgs.BlockingJobs, jobArgs.BlockingMaxRuntimeMinutes).Scan(&blockingJobName, &runningMinutes)
 
 		if err == nil {
-			msg := fmt.Sprintf("Exiting gracefully: blocking job '%s' is currently running.", blockingJobName)
+			msg := fmt.Sprintf("Exiting gracefully: blocking job '%s' is currently running (for %d minutes).", blockingJobName, runningMinutes)
 			logAudit(msg)
 			if ipcClient != nil {
 				ipcClient.SendEvent("exited", msg, 0)
@@ -232,18 +283,28 @@ func main() {
 		}
 	}
 
+	// 3c. Recover packages orphaned by a previous crashed run (we hold the topic lock)
+	if n, err := pkgRepo.ResetSending(context.Background(), jobArgs.Topic); err != nil {
+		fatalf("Failed to reset orphaned packages: %v", err)
+	} else if n > 0 {
+		logAudit(fmt.Sprintf("Reset %d orphaned packages from 'sending' to 'pending'", n))
+	}
+
 	// Fetch target config dynamically
 	targetConfig, err := targetRepo.GetDeliveryTarget(context.Background(), jobArgs.Topic)
 	if err != nil {
-		log.Fatalf("Failed to fetch delivery target config for topic '%s': %v", jobArgs.Topic, err)
+		fatalf("Failed to fetch delivery target config for topic '%s': %v", jobArgs.Topic, err)
 	}
 
 	// 4. Instantiate Delivery Sender
 	var sender delivery.DeliverySender
 	if targetConfig.AdapterType != "CORITY_SAAS" {
-		log.Fatalf("Unsupported adapter_type for Cority: %s", targetConfig.AdapterType)
+		fatalf("Unsupported adapter_type for Cority: %s", targetConfig.AdapterType)
 	}
-	sender = delivery.NewCorityAdapter(nil, logAudit, pool)
+	if _, err := delivery.ParseCorityAuthConfig(targetConfig.AuthConfig); err != nil {
+		fatalf("Invalid delivery target config for topic '%s': %v", jobArgs.Topic, err)
+	}
+	sender = delivery.NewCorityAdapter(nil, logAudit, delivery.NewPGTokenStore(pool))
 	if jobArgs.Workers > 1 {
 		log.Printf("Forcing workers to 1 for CORITY_SAAS to prevent concurrent import errors.")
 		jobArgs.Workers = 1
@@ -269,26 +330,30 @@ func main() {
 	// 5. Worker Pool Setup
 	jobs := make(chan db.Package, jobArgs.BatchSize)
 	var wg sync.WaitGroup
+	var stats deliveryStats
 
 	// Start workers
 	for i := 0; i < jobArgs.Workers; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, jobs, retryEngine, sender, *targetConfig, logAudit)
+		go worker(ctx, &wg, jobs, retryEngine, sender, *targetConfig, logAudit, &stats)
 	}
-
-	totalProcessed := 0
 
 	// 6. Packager: Create delivery packages from target_fragments
 	for {
-		packagedCount, err := pkgRepo.PackageTargetFragments(ctx, jobArgs.Topic, jobArgs.BatchSize*10)
+		packagedCount, failedIDs, err := pkgRepo.PackageTargetFragments(ctx, jobArgs.Topic, jobArgs.BatchSize)
 		if err != nil {
 			log.Printf("Error packaging target fragments: %v", err)
 			break
 		}
-		if packagedCount == 0 {
+		if len(failedIDs) > 0 {
+			logAudit(fmt.Sprintf("Marked %d malformed target fragments as FAILED: %s", len(failedIDs), strings.Join(failedIDs, ", ")))
+		}
+		if packagedCount == 0 && len(failedIDs) == 0 {
 			break
 		}
-		log.Printf("Packaged %d target fragments into new delivery packages.", packagedCount)
+		if packagedCount > 0 {
+			log.Printf("Packaged %d target fragments into a new delivery package.", packagedCount)
+		}
 	}
 
 	// 7. Dispatcher Loop
@@ -318,27 +383,65 @@ dispatcherLoop:
 				break dispatcherLoop
 			}
 		}
-		totalProcessed += len(packages)
 	}
 
 	close(jobs)
 	wg.Wait()
-	log.Printf("Delivery Batch Job finished successfully. Processed %d records.", totalProcessed)
+
+	// Return claimed but unprocessed packages (shutdown, persistence errors) to 'pending'
+	if n, err := pkgRepo.ResetSending(context.WithoutCancel(ctx), jobArgs.Topic); err != nil {
+		log.Printf("Failed to reset unprocessed packages: %v", err)
+	} else if n > 0 {
+		logAudit(fmt.Sprintf("Reset %d unprocessed packages from 'sending' to 'pending'", n))
+	}
+
+	summary := fmt.Sprintf("Topic %s: %d delivered, %d scheduled for retry, %d moved to DLQ, %d interrupted, %d state errors",
+		jobArgs.Topic, stats.delivered.Load(), stats.retry.Load(), stats.dlq.Load(), stats.interrupted.Load(), stats.errors.Load())
+	logAudit(summary)
+
+	status, exitCode := "finished", 0
+	if ctx.Err() != nil {
+		status = "cancelled"
+	}
+	if stats.dlq.Load() > 0 || stats.errors.Load() > 0 {
+		status, exitCode = "failed", 2
+	}
+	log.Printf("Delivery Batch Job %s. %s", status, summary)
 	if ipcClient != nil {
-		ipcClient.SendAudit(fmt.Sprintf("Successfully delivered %d Delivery packages for topic %s", totalProcessed, jobArgs.Topic))
+		ipcClient.SendEvent(status, summary, 100)
 		ipcClient.SendAudit(fmt.Sprintf("%s (%s) finished", appName, version))
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
 	}
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan db.Package, engine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string)) {
+func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats) {
 	defer wg.Done()
 	for pkg := range jobs {
-		err := engine.ProcessPackage(ctx, pkg, sender, config)
+		if ctx.Err() != nil {
+			// Shutdown: leave the package in 'sending'; it is reset to 'pending' after all workers stopped.
+			stats.interrupted.Add(1)
+			continue
+		}
+		outcome, err := retryEngine.ProcessPackage(ctx, pkg, sender, config)
+		switch outcome {
+		case engine.OutcomeDelivered:
+			stats.delivered.Add(1)
+		case engine.OutcomeRetry:
+			stats.retry.Add(1)
+		case engine.OutcomeDLQ:
+			stats.dlq.Add(1)
+		case engine.OutcomeInterrupted:
+			stats.interrupted.Add(1)
+		default:
+			stats.errors.Add(1)
+		}
 		if err != nil {
 			log.Printf("Failed to process package %s: %v", pkg.ID, err)
 			logAudit(fmt.Sprintf("Package %s failed: %v", pkg.ID, err))
 		} else {
-			logAudit(fmt.Sprintf("Package %s delivered successfully (Code: 200/OK)", pkg.ID))
+			logAudit(fmt.Sprintf("Package %s delivered successfully", pkg.ID))
 		}
 	}
 }
@@ -349,12 +452,12 @@ func fetchCredentialsFromScheduler() (string, string, error) {
 	if runIDStr == "" || socketPath == "" {
 		return "", "", fmt.Errorf("not running under scheduler")
 	}
-	
+
 	runID, err := strconv.Atoi(runIDStr)
 	if err != nil {
 		return "", "", err
 	}
-	
+
 	conn, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return "", "", err

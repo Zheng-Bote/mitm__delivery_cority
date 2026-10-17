@@ -1,3 +1,20 @@
+/**
+ * SPDX-FileComment: Delivery Retry Engine
+ * SPDX-FileType: SOURCE
+ * SPDX-FileContributor: ZHENG Robert
+ * SPDX-FileCopyrightText: 2026 ZHENG Robert
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * @file retry_engine.go
+ * @brief Delivery lifecycle of packages with exponential backoff and DLQ handling
+ * @version 0.21.0
+ * @date 2026-10-17
+ *
+ * @author ZHENG Robert (robert@hase-zheng.net)
+ * @copyright Copyright (c) 2026 ZHENG Robert
+ * @LICENSE Apache-2.0
+ */
+
 package engine
 
 import (
@@ -39,13 +56,35 @@ func NewRetryEngine(pkgRepo PackageRepo, dlqRepo DLQRepo, maxRetries int) *Retry
 	}
 }
 
+// Outcome describes what happened to a package after a delivery attempt.
+type Outcome int
+
+const (
+	OutcomeDelivered   Outcome = iota // Delivered and marked as delivered.
+	OutcomeRetry                      // Failed transiently and scheduled for retry.
+	OutcomeDLQ                        // Failed permanently and moved to the DLQ.
+	OutcomeInterrupted                // Aborted by shutdown; left in 'sending' to be reset to 'pending'.
+	OutcomeError                      // The package state could not be persisted.
+)
+
 // ProcessPackage attempts to send a package and updates its state in the database.
-func (e *RetryEngine) ProcessPackage(ctx context.Context, pkg db.Package, sender delivery.DeliverySender, targetCfg delivery.TargetConfig) error {
+func (e *RetryEngine) ProcessPackage(ctx context.Context, pkg db.Package, sender delivery.DeliverySender, targetCfg delivery.TargetConfig) (Outcome, error) {
 	err := sender.Send(ctx, targetCfg, pkg.IdempotencyKey, pkg.Payload)
+
+	// Persist the result even if a shutdown cancels ctx meanwhile.
+	dbCtx := context.WithoutCancel(ctx)
 
 	if err == nil {
 		// Delivery successful
-		return e.pkgRepo.UpdateStatusDelivered(ctx, pkg.ID)
+		if dbErr := e.pkgRepo.UpdateStatusDelivered(dbCtx, pkg.ID); dbErr != nil {
+			return OutcomeError, fmt.Errorf("failed to mark package as delivered: %w", dbErr)
+		}
+		return OutcomeDelivered, nil
+	}
+
+	if ctx.Err() != nil {
+		// Shutdown interrupted the attempt; do not count it as a retry.
+		return OutcomeInterrupted, fmt.Errorf("delivery interrupted by shutdown: %w", err)
 	}
 
 	// Delivery failed, inspect error
@@ -61,10 +100,10 @@ func (e *RetryEngine) ProcessPackage(ctx context.Context, pkg db.Package, sender
 
 	if !delErr.IsTransient || pkg.RetryCount >= e.maxRetries {
 		// Fatal error or max retries exceeded -> Move to DLQ
-		if dbErr := e.dlqRepo.MoveToDLQ(ctx, pkg, delErr.ErrorCode, delErr.ErrorMessage); dbErr != nil {
-			return fmt.Errorf("failed to move to DLQ: %w", dbErr)
+		if dbErr := e.dlqRepo.MoveToDLQ(dbCtx, pkg, delErr.ErrorCode, delErr.ErrorMessage); dbErr != nil {
+			return OutcomeError, fmt.Errorf("failed to move to DLQ: %w", dbErr)
 		}
-		return fmt.Errorf("delivery failed permanently (moved to DLQ): %w", delErr)
+		return OutcomeDLQ, fmt.Errorf("delivery failed permanently (moved to DLQ): %w", delErr)
 	}
 
 	// Transient error with remaining retries -> Exponential backoff
@@ -73,8 +112,8 @@ func (e *RetryEngine) ProcessPackage(ctx context.Context, pkg db.Package, sender
 	backoffSeconds := math.Pow(2, float64(pkg.RetryCount))
 	nextRetryAt := time.Now().Add(time.Duration(backoffSeconds) * time.Second)
 
-	if dbErr := e.pkgRepo.UpdateStatusFailed(ctx, pkg.ID, delErr.ErrorMessage, nextRetryAt, pkg.RetryCount); dbErr != nil {
-		return fmt.Errorf("failed to schedule retry: %w", dbErr)
+	if dbErr := e.pkgRepo.UpdateStatusFailed(dbCtx, pkg.ID, delErr.ErrorMessage, nextRetryAt, pkg.RetryCount); dbErr != nil {
+		return OutcomeError, fmt.Errorf("failed to schedule retry: %w", dbErr)
 	}
-	return fmt.Errorf("delivery failed transiently (scheduled for retry): %w", delErr)
+	return OutcomeRetry, fmt.Errorf("delivery failed transiently (scheduled for retry): %w", delErr)
 }
