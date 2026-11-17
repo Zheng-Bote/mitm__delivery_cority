@@ -7,8 +7,8 @@
  *
  * @file main.go
  * @brief Entry point: packages target fragments and delivers them to Cority SaaS
- * @version 0.22.0
- * @date 2026-10-17
+ * @version 0.22.1
+ * @date 2026-11-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
  * @copyright Copyright (c) 2026 ZHENG Robert
@@ -47,7 +47,7 @@ import (
 var (
 	appName        = "Delivery Engine"
 	appDescription = "Delivers packaged data to target systems"
-	version        = "0.22.0"
+	version        = "0.22.1"
 )
 
 type JobArgs struct {
@@ -103,7 +103,99 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func versionTag() string {
+	v := strings.TrimPrefix(strings.Split(version, "-")[0], "v")
+	return "v" + v
+}
+
+func startSystemLogMessage(jobName string) string {
+	if jobName == "" {
+		jobName = appName
+	}
+	return fmt.Sprintf("Starting job %s (%s)", jobName, versionTag())
+}
+
+func resolveJobName(ctx context.Context, pool *pgxpool.Pool, runID int, topic string) string {
+	if pool != nil && runID > 0 {
+		var name string
+		err := pool.QueryRow(ctx, `
+			SELECT sp.name
+			FROM program_runs pr
+			JOIN scheduled_programs sp ON pr.program_id = sp.id
+			WHERE pr.id = $1`, runID).Scan(&name)
+		if err == nil && name != "" {
+			return name
+		}
+	}
+	if topic != "" {
+		return "Delivery " + topic
+	}
+	return appName
+}
+
+func logSystem(pool *pgxpool.Pool, level, message string) {
+	if pool == nil {
+		return
+	}
+	_, _ = pool.Exec(context.Background(),
+		"INSERT INTO system_logs (level, component, message) VALUES ($1, 'mitm_delivery', $2)",
+		level, message)
+}
+
+func logAudit(ipcClient *ipc.IPCClient, msg string) {
+	log.Printf("AUDIT: %s", msg)
+	ipcClient.SendAudit(msg)
+}
+
+func failf(ipcClient *ipc.IPCClient, pool *pgxpool.Pool, jobName, format string, args ...interface{}) int {
+	if jobName == "" {
+		jobName = appName
+	}
+	msg := fmt.Sprintf(format, args...)
+	log.Print(msg)
+	ipcClient.SendEvent("failed", msg, 0)
+	ipcClient.SendAudit("ERROR: " + msg)
+	ipcClient.SendAudit(fmt.Sprintf("%s (%s) failed", appName, versionTag()))
+	logSystem(pool, "ERROR", fmt.Sprintf("Job %s (%s) failed: %s", jobName, versionTag(), msg))
+	return 1
+}
+
+func exitGracefully(ipcClient *ipc.IPCClient, pool *pgxpool.Pool, jobName, msg string) int {
+	if jobName == "" {
+		jobName = appName
+	}
+	logAudit(ipcClient, msg)
+	ipcClient.SendEvent("exited", msg, 0)
+	ipcClient.SendAudit(fmt.Sprintf("%s (%s) exited", appName, versionTag()))
+	logSystem(pool, "INFO", fmt.Sprintf("Job %s (%s) exited: %s", jobName, versionTag(), msg))
+	return 0
+}
+
+func finishRun(ipcClient *ipc.IPCClient, pool *pgxpool.Pool, jobName, status, summary string, exitCode int) int {
+	if jobName == "" {
+		jobName = appName
+	}
+	level := "INFO"
+	if status == "failed" {
+		level = "ERROR"
+		logAudit(ipcClient, "ERROR: "+summary)
+	} else {
+		logAudit(ipcClient, summary)
+	}
+	log.Printf("Delivery Batch Job %s. %s", status, summary)
+	ipcClient.SendEvent(status, summary, 100)
+	ipcClient.SendAudit(fmt.Sprintf("%s (%s) %s", appName, versionTag(), status))
+	logSystem(pool, level, fmt.Sprintf("Job %s (%s) %s. %s", jobName, versionTag(), status, summary))
+	return exitCode
+}
+
 func main() {
+	if exitCode := run(); exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func run() int {
 	// Secrets are kept in variables only (never written to the process environment).
 	// ENV values are the fallback for standalone execution.
 	dbConfigJSON := os.Getenv("MITM_DB_CONFIG_JSON")
@@ -121,16 +213,33 @@ func main() {
 		log.Printf("[IPC Warning] Failed to get credentials from scheduler: %v", err)
 	}
 
-	version = strings.Split(version, "-")[0]
+	version = strings.TrimPrefix(strings.Split(version, "-")[0], "v")
 
+	runID, _ := strconv.Atoi(getEnv("RUN_ID", "0"))
+	socketPath := getEnv("SCHEDULER_SOCKET_PATH", "")
+
+	var ipcClient *ipc.IPCClient
+	if runID > 0 && socketPath != "" {
+		ipcClient = &ipc.IPCClient{
+			SocketPath: socketPath,
+			RunID:      runID,
+			Component:  "mitm_delivery",
+			SourceName: "DELIVERY",
+		}
+		ipcClient.SendEvent("started", fmt.Sprintf("%s (%s) started", appName, versionTag()), 0)
+		ipcClient.SendAudit(fmt.Sprintf("%s (%s) started", appName, versionTag()))
+	}
+	defer ipcClient.Close()
+
+	jobName := appName
 	if len(os.Args) < 2 {
-		log.Fatalf("Usage: %s <job_args_json>", os.Args[0])
+		return failf(ipcClient, nil, jobName, "Usage: %s <job_args_json>", os.Args[0])
 	}
 
 	// 1. Parse Job Arguments (os.Args[1])
 	var jobArgs JobArgs
 	if err := json.Unmarshal([]byte(os.Args[1]), &jobArgs); err != nil {
-		log.Fatalf("Failed to parse JobArgs JSON from os.Args[1]: %v", err)
+		return failf(ipcClient, nil, jobName, "Failed to parse JobArgs JSON from os.Args[1]: %v", err)
 	}
 
 	if jobArgs.Workers <= 0 {
@@ -150,6 +259,14 @@ func main() {
 	}
 	if jobArgs.MaxRetryWaitSeconds == 0 {
 		jobArgs.MaxRetryWaitSeconds = 300
+	}
+	if jobArgs.Topic != "" {
+		jobName = "Delivery " + jobArgs.Topic
+	}
+
+	if ipcClient != nil {
+		ipcClient.Topic = jobArgs.Topic
+		ipcClient.SourceName = jobArgs.SourceName
 	}
 
 	// 2. Database Connection Setup
@@ -174,7 +291,7 @@ func main() {
 			} `json:"db"`
 		}
 		if err := json.Unmarshal([]byte(jsonConfig), &fullCfg); err != nil {
-			log.Fatalf("Failed to parse MitM JSON configuration: %v", err)
+			return failf(ipcClient, nil, jobName, "Failed to parse MitM JSON configuration: %v", err)
 		}
 		dbHost = fullCfg.DB.Host
 		dbPort = fmt.Sprintf("%d", fullCfg.DB.Port)
@@ -194,6 +311,8 @@ func main() {
 		dbPass = getEnv("MITM_DB_PASSWORD", getEnv("DB_PASS", getEnv("PGPASSWORD", "")))
 		dbName = getEnv("MITM_DB_NAME", getEnv("DB_NAME", getEnv("PGDATABASE", "postgres")))
 	}
+
+	ipcClient.SendAudit(fmt.Sprintf("Loaded database configuration from %s", configSource))
 
 	sslMode := "disable"
 	if sslModeSetting != "" {
@@ -217,14 +336,17 @@ func main() {
 		pool, err = pgxpool.NewWithConfig(context.Background(), config_pool)
 	}
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
+		return failf(ipcClient, nil, jobName, "Unable to connect to database: %v", err)
 	}
 	defer pool.Close()
+
+	jobName = resolveJobName(context.Background(), pool, runID, jobArgs.Topic)
+	logSystem(pool, "INFO", startSystemLogMessage(jobName))
 
 	// 2b. Singleton Lock via Postgres Advisory Lock
 	lockConn, err := pool.Acquire(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to acquire connection for advisory lock: %v", err)
+		return failf(ipcClient, pool, jobName, "Failed to acquire connection for advisory lock: %v", err)
 	}
 	defer lockConn.Release()
 
@@ -234,11 +356,10 @@ func main() {
 	var locked bool
 	err = lockConn.QueryRow(context.Background(), "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lockName).Scan(&locked)
 	if err != nil {
-		log.Fatalf("Failed to execute pg_try_advisory_lock: %v", err)
+		return failf(ipcClient, pool, jobName, "Failed to execute pg_try_advisory_lock: %v", err)
 	}
 	if !locked {
-		log.Printf("Another delivery instance for topic '%s' is already running (Advisory Lock '%s'). Exiting gracefully.", jobArgs.Topic, lockName)
-		os.Exit(0)
+		return exitGracefully(ipcClient, pool, jobName, fmt.Sprintf("Another delivery instance for topic '%s' is already running (Advisory Lock '%s'). Exiting gracefully.", jobArgs.Topic, lockName))
 	}
 
 	// 3. Initialize Repositories and Engine
@@ -248,42 +369,8 @@ func main() {
 
 	targetRepo := db.NewTargetRepo(pool)
 
-	runIDStr := getEnv("RUN_ID", "0")
-	var runID int
-	fmt.Sscanf(runIDStr, "%d", &runID)
-	socketPath := getEnv("SCHEDULER_SOCKET_PATH", "")
-
-	var ipcClient *ipc.IPCClient
-	if runID > 0 && socketPath != "" {
-		ipcClient = &ipc.IPCClient{
-			SocketPath: socketPath,
-			RunID:      runID,
-			Component:  "mitm_delivery",
-			Topic:      jobArgs.Topic,
-			SourceName: jobArgs.SourceName,
-		}
-		ipcClient.SendEvent("started", fmt.Sprintf("%s (%s) started", appName, version), 0)
-		ipcClient.SendAudit(fmt.Sprintf("%s (%s) started", appName, version))
-		ipcClient.SendAudit(fmt.Sprintf("Loaded database configuration from %s", configSource))
-	}
-	defer ipcClient.Close()
-
-	// Helper for audit logging
-	logAudit := func(msg string) {
-		log.Printf("AUDIT: %s", msg)
-		if ipcClient != nil {
-			ipcClient.SendAudit(msg)
-		}
-	}
-
-	// Helper for fatal errors after the scheduler has been notified about the start
-	fatalf := func(format string, args ...interface{}) {
-		msg := fmt.Sprintf(format, args...)
-		log.Print(msg)
-		if ipcClient != nil {
-			ipcClient.SendEvent("failed", msg, 0)
-		}
-		os.Exit(1)
+	auditFn := func(msg string) {
+		logAudit(ipcClient, msg)
 	}
 
 	// 3b. Check for Blocking Jobs
@@ -301,12 +388,7 @@ func main() {
 			LIMIT 1`, jobArgs.BlockingJobs, jobArgs.BlockingMaxRuntimeMinutes).Scan(&blockingJobName, &runningMinutes)
 
 		if err == nil {
-			msg := fmt.Sprintf("Exiting gracefully: blocking job '%s' is currently running (for %d minutes).", blockingJobName, runningMinutes)
-			logAudit(msg)
-			if ipcClient != nil {
-				ipcClient.SendEvent("exited", msg, 0)
-			}
-			os.Exit(0)
+			return exitGracefully(ipcClient, pool, jobName, fmt.Sprintf("Exiting gracefully: blocking job '%s' is currently running (for %d minutes).", blockingJobName, runningMinutes))
 		} else if err != pgx.ErrNoRows {
 			log.Printf("Warning: Failed to check blocking jobs: %v", err)
 		}
@@ -314,26 +396,26 @@ func main() {
 
 	// 3c. Recover packages orphaned by a previous crashed run (we hold the topic lock)
 	if n, err := pkgRepo.ResetSending(context.Background(), jobArgs.Topic); err != nil {
-		fatalf("Failed to reset orphaned packages: %v", err)
+		return failf(ipcClient, pool, jobName, "Failed to reset orphaned packages: %v", err)
 	} else if n > 0 {
-		logAudit(fmt.Sprintf("Reset %d orphaned packages from 'sending' to 'pending'", n))
+		logAudit(ipcClient, fmt.Sprintf("Reset %d orphaned packages from 'sending' to 'pending'", n))
 	}
 
 	// Fetch target config dynamically
 	targetConfig, err := targetRepo.GetDeliveryTarget(context.Background(), jobArgs.Topic, masterKey)
 	if err != nil {
-		fatalf("Failed to fetch delivery target config for topic '%s': %v", jobArgs.Topic, err)
+		return failf(ipcClient, pool, jobName, "Failed to fetch delivery target config for topic '%s': %v", jobArgs.Topic, err)
 	}
 
 	// 4. Instantiate Delivery Sender
 	var sender delivery.DeliverySender
 	if targetConfig.AdapterType != "CORITY_SAAS" {
-		fatalf("Unsupported adapter_type for Cority: %s", targetConfig.AdapterType)
+		return failf(ipcClient, pool, jobName, "Unsupported adapter_type for Cority: %s", targetConfig.AdapterType)
 	}
 	if _, err := delivery.ParseCorityAuthConfig(targetConfig.AuthConfig); err != nil {
-		fatalf("Invalid delivery target config for topic '%s': %v", jobArgs.Topic, err)
+		return failf(ipcClient, pool, jobName, "Invalid delivery target config for topic '%s': %v", jobArgs.Topic, err)
 	}
-	sender = delivery.NewCorityAdapter(nil, logAudit, delivery.NewPGTokenStore(pool))
+	sender = delivery.NewCorityAdapter(nil, auditFn, delivery.NewPGTokenStore(pool))
 	if jobArgs.Workers > 1 {
 		log.Printf("Forcing workers to 1 for CORITY_SAAS to prevent concurrent import errors.")
 		jobArgs.Workers = 1
@@ -358,16 +440,18 @@ func main() {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
 	go func() {
-		<-sigs
-		log.Println("Shutting down gracefully...")
-		cancel()
+		select {
+		case <-sigs:
+			log.Println("Shutting down gracefully...")
+			cancel()
+		case <-baseCtx.Done():
+		}
 	}()
 
 	log.Printf("Starting Delivery Batch Job (Workers: %d, Batch Size: %d)...", jobArgs.Workers, jobArgs.BatchSize)
-	if ipcClient != nil {
-		ipcClient.SendEvent("processing", fmt.Sprintf("Starting Delivery Batch Job (Workers: %d, Batch Size: %d)...", jobArgs.Workers, jobArgs.BatchSize), 0)
-	}
+	ipcClient.SendEvent("processing", fmt.Sprintf("Starting Delivery Batch Job (Workers: %d, Batch Size: %d)...", jobArgs.Workers, jobArgs.BatchSize), 0)
 
 	// 5. Worker Pool Setup
 	jobs := make(chan db.Package, jobArgs.BatchSize)
@@ -378,18 +462,23 @@ func main() {
 	// Start workers
 	for i := 0; i < jobArgs.Workers; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, logAudit, &stats, abortJob)
+		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, auditFn, &stats, abortJob)
 	}
 
 	// 6. Packager: Create delivery packages from target_fragments
+	packagingFailed := false
 	for {
 		packagedCount, failedIDs, err := pkgRepo.PackageTargetFragments(ctx, jobArgs.Topic, jobArgs.BatchSize)
 		if err != nil {
-			log.Printf("Error packaging target fragments: %v", err)
+			if ctx.Err() == nil {
+				log.Printf("Error packaging target fragments: %v", err)
+				logAudit(ipcClient, fmt.Sprintf("ERROR: Error packaging target fragments: %v", err))
+				packagingFailed = true
+			}
 			break
 		}
 		if len(failedIDs) > 0 {
-			logAudit(fmt.Sprintf("Marked %d malformed target fragments as FAILED: %s", len(failedIDs), strings.Join(failedIDs, ", ")))
+			logAudit(ipcClient, fmt.Sprintf("Marked %d malformed target fragments as FAILED: %s", len(failedIDs), strings.Join(failedIDs, ", ")))
 		}
 		if packagedCount == 0 && len(failedIDs) == 0 {
 			break
@@ -411,7 +500,7 @@ func main() {
 		consecutiveErrors++
 		log.Printf("Error %s (%d/%d): %v", what, consecutiveErrors, jobArgs.MaxConsecutiveErrors, err)
 		if consecutiveErrors >= jobArgs.MaxConsecutiveErrors {
-			logAudit(fmt.Sprintf("Aborting: %s failed %d times in a row: %v", what, consecutiveErrors, err))
+			logAudit(ipcClient, fmt.Sprintf("Aborting: %s failed %d times in a row: %v", what, consecutiveErrors, err))
 			claimFailed = true
 			return false
 		}
@@ -478,33 +567,25 @@ dispatcherLoop:
 	if n, err := pkgRepo.ResetSending(context.WithoutCancel(ctx), jobArgs.Topic); err != nil {
 		log.Printf("Failed to reset unprocessed packages: %v", err)
 	} else if n > 0 {
-		logAudit(fmt.Sprintf("Reset %d unprocessed packages from 'sending' to 'pending'", n))
+		logAudit(ipcClient, fmt.Sprintf("Reset %d unprocessed packages from 'sending' to 'pending'", n))
 	}
 
 	summary := fmt.Sprintf("Topic %s: %d delivered, %d scheduled for retry, %d moved to DLQ, %d records withheld (DLQ), %d interrupted, %d state errors",
 		jobArgs.Topic, stats.delivered.Load(), stats.retry.Load(), stats.dlq.Load(), stats.rejected.Load(), stats.interrupted.Load(), stats.errors.Load())
-	logAudit(summary)
 
 	status, exitCode := "finished", 0
 	switch {
-	case aborted.Load() || claimFailed:
+	case aborted.Load() || claimFailed || packagingFailed:
 		status, exitCode = "failed", 1
 	case stats.dlq.Load() > 0 || stats.rejected.Load() > 0 || stats.errors.Load() > 0:
 		status, exitCode = "failed", 2
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		status = "timeout"
-		logAudit(fmt.Sprintf("Max runtime of %d minutes reached; remaining packages are left for the next run", jobArgs.MaxRuntimeMinutes))
+		logAudit(ipcClient, fmt.Sprintf("Max runtime of %d minutes reached; remaining packages are left for the next run", jobArgs.MaxRuntimeMinutes))
 	case ctx.Err() != nil:
 		status = "cancelled"
 	}
-	log.Printf("Delivery Batch Job %s. %s", status, summary)
-	if ipcClient != nil {
-		ipcClient.SendEvent(status, summary, 100)
-		ipcClient.SendAudit(fmt.Sprintf("%s (%s) finished", appName, version))
-	}
-	if exitCode != 0 {
-		os.Exit(exitCode)
-	}
+	return finishRun(ipcClient, pool, jobName, status, summary, exitCode)
 }
 
 func worker(ctx context.Context, wg *sync.WaitGroup, batch *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, abortJob func()) {
