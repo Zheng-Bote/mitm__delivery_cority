@@ -512,3 +512,52 @@ func TestSlowdownAbortsOnCancel(t *testing.T) {
 		t.Errorf("slowdown did not abort on cancellation")
 	}
 }
+
+func TestEffectiveMaxRuntimeMinutesFromAuthConfigAndUploadOptions(t *testing.T) {
+	cfg, err := ParseCorityAuthConfig([]byte(`{"max_runtime_minutes": "45"}`))
+	if err != nil || cfg.EffectiveMaxRuntimeMinutes() != 45 {
+		t.Fatalf("expected 45 from top-level string, got %d / %v", cfg.EffectiveMaxRuntimeMinutes(), err)
+	}
+	cfg, err = ParseCorityAuthConfig([]byte(`{"upload_options": {"max_runtime_minutes": "30"}}`))
+	if err != nil || cfg.EffectiveMaxRuntimeMinutes() != 30 {
+		t.Fatalf("expected 30 from upload_options string, got %d / %v", cfg.EffectiveMaxRuntimeMinutes(), err)
+	}
+	cfg, err = ParseCorityAuthConfig([]byte(`{"upload_options": {"max_runtime_minutes": 15}}`))
+	if err != nil || cfg.EffectiveMaxRuntimeMinutes() != 15 {
+		t.Fatalf("expected 15 from upload_options number, got %d / %v", cfg.EffectiveMaxRuntimeMinutes(), err)
+	}
+}
+
+func TestCancelledUploadDoesNotAuditNetworkError(t *testing.T) {
+	unblock := make(chan struct{})
+
+	fake := &fakeCority{}
+	mux := http.NewServeMux()
+	mux.Handle("/api/", fake.handler())
+	mux.HandleFunc("/api/employeeimport", func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	defer close(unblock)
+
+	var audits []string
+	adapter := NewCorityAdapter(nil, func(msg string) {
+		audits = append(audits, msg)
+	}, newMemTokenStore())
+	target := corityTarget(t, srv.URL, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	_, err := adapter.Send(ctx, target, "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || delErr.ErrorCode != "CANCELLED" {
+		t.Fatalf("expected CANCELLED DeliveryError, got %v", err)
+	}
+	for _, msg := range audits {
+		if len(msg) >= 12 && msg[:12] == "Upload Error" {
+			t.Errorf("unexpected Upload Error audit on context deadline: %s", msg)
+		}
+	}
+}

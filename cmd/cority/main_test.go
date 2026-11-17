@@ -7,7 +7,7 @@
  *
  * @file main_test.go
  * @brief Unit tests for the database connection string builder and IPC exit reporting
- * @version 0.22.1
+ * @version 0.22.2
  * @date 2026-11-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -19,7 +19,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -30,6 +32,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"mitm_cority/internal/db"
+	"mitm_cority/internal/delivery"
+	"mitm_cority/internal/engine"
 	"mitm_cority/internal/ipc"
 )
 
@@ -262,5 +267,84 @@ func TestRunEarlyExitEmitsStartAndFailOverIPC(t *testing.T) {
 	}
 	if events[4].Type != "audit" || !strings.HasSuffix(events[4].Message, "failed") {
 		t.Errorf("expected final failed audit event, got %+v", events[4])
+	}
+}
+
+func TestJobArgsAcceptNumericStrings(t *testing.T) {
+	var args JobArgs
+	raw := `{"topic":"Employee","workers":"1","batch_size":"50","max_retries":"3","blocking_max_runtime_minutes":"120","max_consecutive_errors":"4","max_runtime_minutes":"45","max_retry_wait_seconds":"60"}`
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if args.MaxRuntimeMinutes != 45 || args.BlockingMaxRuntimeMinutes != 120 || args.BatchSize != 50 {
+		t.Errorf("unexpected parsed JobArgs: %+v", args)
+	}
+}
+
+func TestResolveTerminalOutcomeTimeoutPrecedesDLQ(t *testing.T) {
+	var stats deliveryStats
+	stats.dlq.Store(1)
+	stats.rejected.Store(2)
+
+	status, code := resolveTerminalOutcome(context.DeadlineExceeded, false, false, false, &stats)
+	if status != "timeout" || code != 0 {
+		t.Fatalf("expected timeout/0 even with prior DLQ records, got %s/%d", status, code)
+	}
+
+	status, code = resolveTerminalOutcome(nil, false, false, false, &stats)
+	if status != "failed" || code != 2 {
+		t.Fatalf("expected failed/2 when no deadline exceeded, got %s/%d", status, code)
+	}
+
+	status, code = resolveTerminalOutcome(context.DeadlineExceeded, true, false, false, &stats)
+	if status != "failed" || code != 1 {
+		t.Fatalf("expected failed/1 when job aborted, got %s/%d", status, code)
+	}
+}
+
+func TestShouldWaitForRetryRespectsDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Next retry is in 2 minutes (within maxRetryWait=5m, but after ctx deadline=30s)
+	if _, ok := shouldWaitForRetry(ctx, time.Now().Add(2*time.Minute), 5*time.Minute); ok {
+		t.Errorf("must not wait for retry scheduled after ctx deadline")
+	}
+
+	// Next retry is in 5 seconds (before ctx deadline=30s and within maxRetryWait=5m)
+	if wait, ok := shouldWaitForRetry(ctx, time.Now().Add(5*time.Second), 5*time.Minute); !ok || wait < time.Second {
+		t.Errorf("expected valid wait duration, got %v / %v", wait, ok)
+	}
+}
+
+type blockingSender struct{}
+
+func (blockingSender) Send(ctx context.Context, _ delivery.TargetConfig, _ string, _ []byte) (delivery.SendResult, error) {
+	<-ctx.Done()
+	return delivery.SendResult{}, errors.New("context deadline exceeded")
+}
+
+func TestProcessPackageInterruptedDoesNotLogPackageFailed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var audits []string
+	var stats deliveryStats
+
+	re := engine.NewRetryEngine(nil, nil, 5)
+	done := make(chan struct{})
+	go func() {
+		processPackage(ctx, db.Package{ID: "pkg-1"}, re, blockingSender{}, delivery.TargetConfig{}, func(msg string) {
+			audits = append(audits, msg)
+		}, &stats, func() {})
+		close(done)
+	}()
+
+	cancel()
+	<-done
+
+	if stats.interrupted.Load() != 1 {
+		t.Fatalf("expected 1 interrupted package, got %d", stats.interrupted.Load())
+	}
+	if len(audits) != 0 {
+		t.Errorf("interrupted package must not emit failure audit, got %v", audits)
 	}
 }

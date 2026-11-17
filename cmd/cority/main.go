@@ -7,7 +7,7 @@
  *
  * @file main.go
  * @brief Entry point: packages target fragments and delivers them to Cority SaaS
- * @version 0.22.1
+ * @version 0.22.2
  * @date 2026-11-17
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
@@ -47,29 +47,79 @@ import (
 var (
 	appName        = "Delivery Engine"
 	appDescription = "Delivers packaged data to target systems"
-	version        = "0.22.1"
+	version        = "0.22.2"
 )
+
+// flexInt accepts a JSON number or a numeric JSON string ("" and null count as 0).
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(strings.Trim(string(b), `"`))
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("invalid integer value %s", string(b))
+	}
+	*f = flexInt(n)
+	return nil
+}
 
 type JobArgs struct {
 	Topic        string   `json:"topic"`
-	Workers      int      `json:"workers"`
-	BatchSize    int      `json:"batch_size"`
-	MaxRetries   int      `json:"max_retries"`
+	Workers      flexInt  `json:"workers"`
+	BatchSize    flexInt  `json:"batch_size"`
+	MaxRetries   flexInt  `json:"max_retries"`
 	SourceName   string   `json:"source_name"`
 	BlockingJobs []string `json:"blocking_jobs"`
 	// BlockingMaxRuntimeMinutes ignores blocking runs started longer ago (0 = no limit).
-	BlockingMaxRuntimeMinutes int `json:"blocking_max_runtime_minutes"`
+	BlockingMaxRuntimeMinutes flexInt `json:"blocking_max_runtime_minutes"`
 	// MaxConsecutiveErrors aborts the job after this many failed claim attempts in a row (default 5).
-	MaxConsecutiveErrors int `json:"max_consecutive_errors"`
+	MaxConsecutiveErrors flexInt `json:"max_consecutive_errors"`
 	// MaxRuntimeMinutes stops the job gracefully after this time (0 = no limit).
-	MaxRuntimeMinutes int `json:"max_runtime_minutes"`
+	MaxRuntimeMinutes flexInt `json:"max_runtime_minutes"`
 	// MaxRetryWaitSeconds waits in-run for retries due within this time (0 = default 300, negative = off).
-	MaxRetryWaitSeconds int `json:"max_retry_wait_seconds"`
+	MaxRetryWaitSeconds flexInt `json:"max_retry_wait_seconds"`
 }
 
 // deliveryStats counts package outcomes across workers.
 type deliveryStats struct {
 	delivered, retry, dlq, interrupted, errors, rejected atomic.Int64
+}
+
+// shouldWaitForRetry decides whether the dispatcher should sleep until next before claiming again.
+func shouldWaitForRetry(ctx context.Context, next time.Time, maxRetryWait time.Duration) (time.Duration, bool) {
+	if maxRetryWait <= 0 {
+		return 0, false
+	}
+	wait := time.Until(next)
+	if wait > maxRetryWait {
+		return 0, false
+	}
+	if deadline, ok := ctx.Deadline(); ok && next.After(deadline) {
+		return 0, false
+	}
+	return max(wait, time.Second), true
+}
+
+// resolveTerminalOutcome maps run state to the final IPC status and process exit code.
+// A graceful max-runtime timeout or signal cancellation returns exit code 0 even if earlier packages
+// had DLQ/rejected records so that scheduler restart_on_exit does not restart a timed-out or stopped run.
+func resolveTerminalOutcome(ctxErr error, aborted, claimFailed, packagingFailed bool, stats *deliveryStats) (string, int) {
+	switch {
+	case aborted || claimFailed || packagingFailed:
+		return "failed", 1
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		return "timeout", 0
+	case ctxErr != nil:
+		return "cancelled", 0
+	case stats.dlq.Load() > 0 || stats.rejected.Load() > 0 || stats.errors.Load() > 0:
+		return "failed", 2
+	default:
+		return "finished", 0
+	}
 }
 
 // sleepCtx sleeps for d and returns false if ctx was cancelled meanwhile.
@@ -365,7 +415,7 @@ func run() int {
 	// 3. Initialize Repositories and Engine
 	pkgRepo := db.NewPackageRepo(pool)
 	dlqRepo := db.NewDLQRepo(pool)
-	retryEngine := engine.NewRetryEngine(pkgRepo, dlqRepo, jobArgs.MaxRetries)
+	retryEngine := engine.NewRetryEngine(pkgRepo, dlqRepo, int(jobArgs.MaxRetries))
 
 	targetRepo := db.NewTargetRepo(pool)
 
@@ -385,7 +435,7 @@ func run() int {
 			  AND pr.finished_at IS NULL 
 			  AND ($2::int = 0 OR pr.started_at > NOW() - make_interval(mins => $2::int))
 			ORDER BY pr.started_at DESC
-			LIMIT 1`, jobArgs.BlockingJobs, jobArgs.BlockingMaxRuntimeMinutes).Scan(&blockingJobName, &runningMinutes)
+			LIMIT 1`, jobArgs.BlockingJobs, int(jobArgs.BlockingMaxRuntimeMinutes)).Scan(&blockingJobName, &runningMinutes)
 
 		if err == nil {
 			return exitGracefully(ipcClient, pool, jobName, fmt.Sprintf("Exiting gracefully: blocking job '%s' is currently running (for %d minutes).", blockingJobName, runningMinutes))
@@ -412,8 +462,17 @@ func run() int {
 	if targetConfig.AdapterType != "CORITY_SAAS" {
 		return failf(ipcClient, pool, jobName, "Unsupported adapter_type for Cority: %s", targetConfig.AdapterType)
 	}
-	if _, err := delivery.ParseCorityAuthConfig(targetConfig.AuthConfig); err != nil {
+	corityCfg, err := delivery.ParseCorityAuthConfig(targetConfig.AuthConfig)
+	if err != nil {
 		return failf(ipcClient, pool, jobName, "Invalid delivery target config for topic '%s': %v", jobArgs.Topic, err)
+	}
+	if jobArgs.MaxRuntimeMinutes <= 0 && corityCfg.EffectiveMaxRuntimeMinutes() > 0 {
+		jobArgs.MaxRuntimeMinutes = flexInt(corityCfg.EffectiveMaxRuntimeMinutes())
+	}
+	if jobArgs.MaxRuntimeMinutes > 0 {
+		logAudit(ipcClient, fmt.Sprintf("Max Runtime: %d minutes", jobArgs.MaxRuntimeMinutes))
+	} else {
+		logAudit(ipcClient, "Max Runtime: unlimited")
 	}
 	sender = delivery.NewCorityAdapter(nil, auditFn, delivery.NewPGTokenStore(pool))
 	if jobArgs.Workers > 1 {
@@ -454,13 +513,13 @@ func run() int {
 	ipcClient.SendEvent("processing", fmt.Sprintf("Starting Delivery Batch Job (Workers: %d, Batch Size: %d)...", jobArgs.Workers, jobArgs.BatchSize), 0)
 
 	// 5. Worker Pool Setup
-	jobs := make(chan db.Package, jobArgs.BatchSize)
+	jobs := make(chan db.Package, int(jobArgs.BatchSize))
 	var wg sync.WaitGroup
 	var batch sync.WaitGroup // tracks the packages of the current dispatcher batch
 	var stats deliveryStats
 
 	// Start workers
-	for i := 0; i < jobArgs.Workers; i++ {
+	for i := 0; i < int(jobArgs.Workers); i++ {
 		wg.Add(1)
 		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, auditFn, &stats, abortJob)
 	}
@@ -468,7 +527,7 @@ func run() int {
 	// 6. Packager: Create delivery packages from target_fragments
 	packagingFailed := false
 	for {
-		packagedCount, failedIDs, err := pkgRepo.PackageTargetFragments(ctx, jobArgs.Topic, jobArgs.BatchSize)
+		packagedCount, failedIDs, err := pkgRepo.PackageTargetFragments(ctx, jobArgs.Topic, int(jobArgs.BatchSize))
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Printf("Error packaging target fragments: %v", err)
@@ -499,7 +558,7 @@ func run() int {
 		}
 		consecutiveErrors++
 		log.Printf("Error %s (%d/%d): %v", what, consecutiveErrors, jobArgs.MaxConsecutiveErrors, err)
-		if consecutiveErrors >= jobArgs.MaxConsecutiveErrors {
+		if consecutiveErrors >= int(jobArgs.MaxConsecutiveErrors) {
 			logAudit(ipcClient, fmt.Sprintf("Aborting: %s failed %d times in a row: %v", what, consecutiveErrors, err))
 			claimFailed = true
 			return false
@@ -514,7 +573,7 @@ dispatcherLoop:
 			break dispatcherLoop
 		}
 
-		packages, err := pkgRepo.ClaimPendingPackages(ctx, jobArgs.Topic, jobArgs.BatchSize)
+		packages, err := pkgRepo.ClaimPendingPackages(ctx, jobArgs.Topic, int(jobArgs.BatchSize))
 		if err != nil {
 			if !handleDBError("claiming packages", err) {
 				break dispatcherLoop
@@ -533,14 +592,14 @@ dispatcherLoop:
 					}
 					continue
 				}
-				if wait := time.Until(next); ok && wait <= maxRetryWait {
-					// At least 1s, so that clock skew to the DB cannot cause a busy loop
-					wait = max(wait, time.Second)
-					log.Printf("Waiting %v for packages scheduled for retry...", wait.Round(time.Second))
-					if !sleepCtx(ctx, wait) {
-						break dispatcherLoop
+				if ok {
+					if wait, okWait := shouldWaitForRetry(ctx, next, maxRetryWait); okWait {
+						log.Printf("Waiting %v for packages scheduled for retry...", wait.Round(time.Second))
+						if !sleepCtx(ctx, wait) {
+							break dispatcherLoop
+						}
+						continue
 					}
-					continue
 				}
 			}
 			log.Println("No more packages to deliver. Batch job complete.")
@@ -573,18 +632,10 @@ dispatcherLoop:
 	summary := fmt.Sprintf("Topic %s: %d delivered, %d scheduled for retry, %d moved to DLQ, %d records withheld (DLQ), %d interrupted, %d state errors",
 		jobArgs.Topic, stats.delivered.Load(), stats.retry.Load(), stats.dlq.Load(), stats.rejected.Load(), stats.interrupted.Load(), stats.errors.Load())
 
-	status, exitCode := "finished", 0
-	switch {
-	case aborted.Load() || claimFailed || packagingFailed:
-		status, exitCode = "failed", 1
-	case stats.dlq.Load() > 0 || stats.rejected.Load() > 0 || stats.errors.Load() > 0:
-		status, exitCode = "failed", 2
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		status = "timeout"
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		logAudit(ipcClient, fmt.Sprintf("Max runtime of %d minutes reached; remaining packages are left for the next run", jobArgs.MaxRuntimeMinutes))
-	case ctx.Err() != nil:
-		status = "cancelled"
 	}
+	status, exitCode := resolveTerminalOutcome(ctx.Err(), aborted.Load(), claimFailed, packagingFailed, &stats)
 	return finishRun(ipcClient, pool, jobName, status, summary, exitCode)
 }
 
@@ -616,6 +667,7 @@ func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.Ret
 		stats.dlq.Add(1)
 	case engine.OutcomeInterrupted:
 		stats.interrupted.Add(1)
+		return
 	default:
 		stats.errors.Add(1)
 	}
