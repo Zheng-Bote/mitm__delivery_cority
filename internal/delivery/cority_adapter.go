@@ -62,14 +62,23 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 }
 
 type CorityAuthConfig struct {
-	LoginUser       string                 `json:"login_user"`
-	LoginPass       string                 `json:"login_pass"`
-	AuthRefreshPath string                 `json:"auth_refresh_path"`
-	AuthTokenPath   string                 `json:"auth_token_path"`
-	ImportPath      string                 `json:"import_path"`
-	UploadOptions   map[string]interface{} `json:"upload_options"`
-	Slowdown        flexInt                `json:"slowdown"`
-	Timeout         flexInt                `json:"timeout"`
+	LoginUser         string                 `json:"login_user"`
+	LoginPass         string                 `json:"login_pass"`
+	AuthRefreshPath   string                 `json:"auth_refresh_path"`
+	AuthTokenPath     string                 `json:"auth_token_path"`
+	ImportPath        string                 `json:"import_path"`
+	UploadOptions     map[string]interface{} `json:"upload_options"`
+	Slowdown          flexInt                `json:"slowdown"`
+	Timeout           flexInt                `json:"timeout"`
+	MaxRuntimeMinutes flexInt                `json:"max_runtime_minutes"`
+}
+
+// EffectiveMaxRuntimeMinutes returns max_runtime_minutes from top-level auth_config or upload_options.
+func (c CorityAuthConfig) EffectiveMaxRuntimeMinutes() int {
+	if c.MaxRuntimeMinutes > 0 {
+		return int(c.MaxRuntimeMinutes)
+	}
+	return intOption(c.UploadOptions, "max_runtime_minutes")
 }
 
 // ParseCorityAuthConfig parses the decrypted config_payload of a CORITY_SAAS target.
@@ -232,12 +241,29 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 
 	chunks := chunkRecords(rawData, uploadBatchSize(cfg.UploadOptions))
 	for i, chunk := range chunks {
+		if ctx.Err() != nil {
+			return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload interrupted: %v", ctx.Err()), ErrorCode: "CANCELLED"}
+		}
+		if i > 0 {
+			if cfg.Slowdown > 0 {
+				if err := waitCtx(ctx, time.Duration(cfg.Slowdown)*time.Second-time.Since(a.lastUpload)); err != nil {
+					return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload slowdown interrupted: %v", err), ErrorCode: "CANCELLED"}
+				}
+			}
+			if delay := time.Until(a.pauseUntil); delay > 0 {
+				a.audit(fmt.Sprintf("Upload paused for %v as requested by Cority (Retry-After)", delay.Round(time.Second)))
+				if err := waitCtx(ctx, delay); err != nil {
+					return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload pause interrupted: %v", err), ErrorCode: "CANCELLED"}
+				}
+			}
+		}
 		chunkKey := chunkIdempotencyKey(idempotencyKey, i, len(chunks))
 		if len(chunks) > 1 {
 			a.audit(fmt.Sprintf("Uploading chunk %d/%d (%d records, Idempotency-Key: %s)", i+1, len(chunks), len(chunk), chunkKey))
 		}
 
 		status, header, body, err := a.upload(ctx, activeClient, cfg, baseURL, accessToken, chunkKey, chunk, configuredTimeout)
+		a.lastUpload = time.Now()
 		if err != nil {
 			return SendResult{}, err
 		}
@@ -551,6 +577,9 @@ func (a *CorityAdapter) upload(ctx context.Context, client *http.Client, cfg Cor
 	elapsed := time.Since(startTime)
 
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil, nil, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload interrupted: %v", err), ErrorCode: "CANCELLED"}
+		}
 		if elapsed >= time.Duration(configuredTimeout)*time.Second-2*time.Second {
 			a.audit(fmt.Sprintf("Upload Error: Configured timeout of %d seconds reached. Request failed: %v", configuredTimeout, err))
 		} else {
@@ -635,11 +664,15 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 
 // uploadBatchSize reads upload_options.batch_size (number or numeric string); 0 disables chunking.
 func uploadBatchSize(options map[string]interface{}) int {
-	switch v := options["batch_size"].(type) {
+	return intOption(options, "batch_size")
+}
+
+func intOption(options map[string]interface{}, key string) int {
+	switch v := options[key].(type) {
 	case float64:
 		return int(v)
 	case string:
-		n, _ := strconv.Atoi(v)
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
 		return n
 	}
 	return 0

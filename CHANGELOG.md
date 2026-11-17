@@ -1,5 +1,20 @@
 # Changelog - MitM Cority Delivery Layer
 
+## [v0.22.2] - 2026-11-17
+
+Ensure `max_runtime_minutes` reliably takes effect ([#8](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/8)).
+
+### Changed
+
+- **Timeout Precedence Over DLQ Exit Code**: When `max_runtime_minutes` is reached (`context.DeadlineExceeded`), the job now always logs `"Max runtime of <N> minutes reached..."` and exits with status `timeout` and exit code `0` even if earlier packages in the run had DLQ/rejected records, preventing `restart_on_exit` from immediately restarting a timed-out job.
+- **Flexible `max_runtime_minutes` Parsing & Target-Config Fallback**: All numeric fields in `JobArgs` accept both JSON numbers and numeric strings (`flexInt`). If `max_runtime_minutes` is not set in `JobArgs`, the job falls back to `max_runtime_minutes` from `delivery_targets.config_payload` (top-level or `upload_options`) and audit-logs the effective setting (`Max Runtime: <N> minutes` / `unlimited`) at startup.
+- **Per-Chunk Slowdown & Deadline Check**: `CorityAdapter.Send` checks context cancellation and applies `slowdown` / `Retry-After` pauses before every upload chunk.
+- **Deadline-Aware Retry Wait**: The dispatcher skips waiting for `NextRetryAt` when the scheduled retry time is after the active `max_runtime_minutes` deadline.
+
+### Fixed
+
+- Context deadline or shutdown cancellation during an upload or package processing (`OutcomeInterrupted`) no longer emits misleading `"Upload Error: Network failure..."` or `"Package <id> failed..."` audit messages.
+
 ## [v0.22.1] - 2026-11-17
 
 Complete IPC `SendEvent` and `SendAudit` reporting across all program exit paths ([#6](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/6)).

@@ -72,7 +72,7 @@ ARGS_JSON='{
 | `blocking_jobs` | `[]` | Scheduled program names; if one of them has an unfinished `program_runs` entry, the job exits with code 0. |
 | `blocking_max_runtime_minutes` | `0` | Ignores blocking runs started longer ago than this (protects against stale runs left by crashed jobs). `0` = no limit. |
 | `max_consecutive_errors` | `5` | Aborts the job (exit code `1`) after this many failed DB claim attempts in a row; attempts back off 2, 4, 8 … s (max 30 s). |
-| `max_runtime_minutes` | `0` | Stops the job gracefully after this time (status `timeout`); remaining packages are left for the next run. `0` = no limit. |
+| `max_runtime_minutes` | `0` | Stops the job gracefully after this time (status `timeout`, exit code `0`); remaining packages are left for the next run. Also read from `config_payload` (`max_runtime_minutes` or `upload_options.max_runtime_minutes`) when `0` in job args. `0` = no limit. |
 | `max_retry_wait_seconds` | `300` | If only retries are left and the next one is due within this time, the job waits and delivers it in the same run. Negative = off. |
 
 #### Exit Codes & Recovery
