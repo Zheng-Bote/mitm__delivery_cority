@@ -1,5 +1,19 @@
 # Changelog - MitM Cority Delivery Layer
 
+## [v0.22.1] - 2026-11-17
+
+Complete IPC `SendEvent` and `SendAudit` reporting across all program exit paths ([#6](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/6)).
+
+### Changed
+
+- **System Log Version Entry (`system_logs`)**: Writes lifecycle entries directly to `system_logs` (`component = 'mitm_delivery'`) including the job name and version, e.g. `"Starting job Delivery Employee (v0.22.1)"` at start and `"Job <name> (v0.22.1) <status>..."` on exit.
+- **Early IPC Initialization**: `ipcClient` is now initialized at the start of execution (before CLI argument parsing, database connection setup, and advisory lock acquisition) so that early startup failures and lock exits are always reported to the scheduler.
+- **Guaranteed Exit Reporting (`run() int`)**: Extracted `run() int` from `main()` with centralized exit helpers (`failf`, `exitGracefully`, `finishRun`) so that every program exit path emits both `ipcClient.SendEvent` and `ipcClient.SendAudit` (including the `ERROR: ` prefix on failed runs and the actual terminal status `finished`, `failed`, `timeout`, `cancelled`, or `exited` in the final audit line) while running all deferred resource cleanups before `os.Exit`.
+
+### Fixed
+
+- Packaging errors in `PackageTargetFragments` are now audit-logged with `ERROR: ` and mark the batch run as `failed` (exit code 1) instead of silently breaking into the dispatcher loop.
+
 ## [v0.22.0] - 2026-10-17
 
 Follow-up hardening ([#4](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/4)).
