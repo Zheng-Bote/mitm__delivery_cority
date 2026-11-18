@@ -22,7 +22,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
+
+// ipcTimeout bounds dialing the scheduler socket and every write, so a scheduler that does not read
+// can never block the job.
+var ipcTimeout = 5 * time.Second
 
 type StatusEvent struct {
 	RunID     int    `json:"run_id"`
@@ -100,12 +105,13 @@ func (c *IPCClient) send(event StatusEvent) {
 	defer c.mu.Unlock()
 	for attempt := 0; attempt < 2; attempt++ {
 		if c.conn == nil {
-			conn, err := net.Dial("unix", c.SocketPath)
+			conn, err := net.DialTimeout("unix", c.SocketPath, ipcTimeout)
 			if err != nil {
 				return
 			}
 			c.conn = conn
 		}
+		_ = c.conn.SetWriteDeadline(time.Now().Add(ipcTimeout))
 		if _, err := c.conn.Write(data); err == nil {
 			return
 		}

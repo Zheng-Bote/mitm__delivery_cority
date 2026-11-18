@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -71,6 +72,17 @@ type CorityAuthConfig struct {
 	Slowdown          flexInt                `json:"slowdown"`
 	Timeout           flexInt                `json:"timeout"`
 	MaxRuntimeMinutes flexInt                `json:"max_runtime_minutes"`
+	// MaxRetryAfterSeconds caps the honored Retry-After pause (<= 0 or > 3600 = 3600).
+	MaxRetryAfterSeconds flexInt `json:"max_retry_after_seconds"`
+}
+
+// retryAfterCap returns the maximum honored Retry-After pause.
+func (c CorityAuthConfig) retryAfterCap() time.Duration {
+	limit := time.Duration(c.MaxRetryAfterSeconds) * time.Second
+	if limit <= 0 || limit > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return limit
 }
 
 // EffectiveMaxRuntimeMinutes returns max_runtime_minutes from top-level auth_config or upload_options.
@@ -102,9 +114,37 @@ type CorityAdapter struct {
 
 func NewCorityAdapter(client *http.Client, logAudit func(string), tokens TokenStore) *CorityAdapter {
 	if client == nil {
-		client = &http.Client{Timeout: 300 * time.Second}
+		client = &http.Client{Timeout: 300 * time.Second, Transport: newTransport()}
 	}
 	return &CorityAdapter{client: client, logAudit: logAudit, tokens: tokens}
+}
+
+// newTransport returns the adapter's HTTP transport with bounded connect and TLS handshake times,
+// so an unreachable Cority fails fast instead of waiting for the overall request timeout.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = 10 * time.Second
+	return t
+}
+
+// waitForPause waits until a Retry-After pause has passed. If the pause ends after the ctx deadline,
+// it returns a Postpone error at once so that the run stops instead of sleeping into its deadline.
+func (a *CorityAdapter) waitForPause(ctx context.Context) error {
+	delay := time.Until(a.pauseUntil)
+	if delay <= 0 {
+		return nil
+	}
+	if deadline, ok := ctx.Deadline(); ok && a.pauseUntil.After(deadline) {
+		msg := fmt.Sprintf("Upload pause requested by Cority (Retry-After) ends in %v, after the run deadline; stopping the run", delay.Round(time.Second))
+		a.audit(msg)
+		return &DeliveryError{IsTransient: true, Postpone: true, ErrorMessage: msg, ErrorCode: "RETRY_AFTER_EXCEEDS_DEADLINE"}
+	}
+	a.audit(fmt.Sprintf("Upload paused for %v as requested by Cority (Retry-After)", delay.Round(time.Second)))
+	if err := waitCtx(ctx, delay); err != nil {
+		return &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload pause interrupted: %v", err), ErrorCode: "CANCELLED"}
+	}
+	return nil
 }
 
 func (a *CorityAdapter) audit(msg string) {
@@ -162,11 +202,8 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 			return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload slowdown interrupted: %v", err), ErrorCode: "CANCELLED"}
 		}
 	}
-	if delay := time.Until(a.pauseUntil); delay > 0 {
-		a.audit(fmt.Sprintf("Upload paused for %v as requested by Cority (Retry-After)", delay.Round(time.Second)))
-		if err := waitCtx(ctx, delay); err != nil {
-			return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload pause interrupted: %v", err), ErrorCode: "CANCELLED"}
-		}
+	if err := a.waitForPause(ctx); err != nil {
+		return SendResult{}, err
 	}
 
 	defer func() { a.lastUpload = time.Now() }()
@@ -250,11 +287,8 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 					return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload slowdown interrupted: %v", err), ErrorCode: "CANCELLED"}
 				}
 			}
-			if delay := time.Until(a.pauseUntil); delay > 0 {
-				a.audit(fmt.Sprintf("Upload paused for %v as requested by Cority (Retry-After)", delay.Round(time.Second)))
-				if err := waitCtx(ctx, delay); err != nil {
-					return SendResult{}, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("upload pause interrupted: %v", err), ErrorCode: "CANCELLED"}
-				}
+			if err := a.waitForPause(ctx); err != nil {
+				return SendResult{}, err
 			}
 		}
 		chunkKey := chunkIdempotencyKey(idempotencyKey, i, len(chunks))
@@ -291,6 +325,7 @@ func (a *CorityAdapter) Send(ctx context.Context, config TargetConfig, idempoten
 		if err := a.checkUploadResponse(baseURL+cfg.ImportPath, chunkKey, status, header, body); err != nil {
 			var delErr *DeliveryError
 			if errors.As(err, &delErr) && delErr.RetryAfter > 0 {
+				delErr.RetryAfter = min(delErr.RetryAfter, cfg.retryAfterCap())
 				a.pauseUntil = time.Now().Add(delErr.RetryAfter)
 			}
 			return SendResult{}, err
@@ -585,6 +620,8 @@ func (a *CorityAdapter) upload(ctx context.Context, client *http.Client, cfg Cor
 		} else {
 			a.audit(fmt.Sprintf("Upload Error: Network failure after %v: %v", elapsed, err))
 		}
+		// Do not reuse a possibly stale keep-alive connection for the next upload.
+		client.CloseIdleConnections()
 		return 0, nil, nil, &DeliveryError{IsTransient: true, ErrorMessage: fmt.Sprintf("network error during upload: %v", err), ErrorCode: "NETWORK_ERROR"}
 	}
 	defer resp3.Body.Close()

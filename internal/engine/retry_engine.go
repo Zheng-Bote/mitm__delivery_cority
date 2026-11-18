@@ -67,6 +67,7 @@ const (
 	OutcomeInterrupted                // Aborted by shutdown; left in 'sending' to be reset to 'pending'.
 	OutcomeError                      // The package state could not be persisted.
 	OutcomeAbort                      // The job must stop (e.g. authentication failure); left in 'sending'.
+	OutcomePostponed                  // The run must stop without consuming a retry; left in 'sending'.
 )
 
 // maxRetryAfter caps a target-requested retry delay.
@@ -113,6 +114,11 @@ func (e *RetryEngine) ProcessPackage(ctx context.Context, pkg db.Package, sender
 			ErrorCode:    "UNKNOWN_ERROR",
 			ErrorMessage: err.Error(),
 		}
+	}
+
+	if delErr.Postpone {
+		// Run-level stop: leave the package untouched (no retry consumed, no DLQ).
+		return Result{Outcome: OutcomePostponed}, fmt.Errorf("delivery postponed (%s): %w", delErr.ErrorCode, delErr)
 	}
 
 	if delErr.Abort {

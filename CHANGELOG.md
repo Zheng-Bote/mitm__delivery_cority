@@ -1,5 +1,22 @@
 # Changelog - MitM Cority Delivery Layer
 
+## [v0.23.0] - 2026-11-18
+
+Circuit breaker, Retry-After deadline, HTTP transport and hard runtime limit ([#10](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/10)).
+The hang observed on Dev/Int (no audit after the last successful delivery, `max_runtime_minutes` without effect) was mainly caused by the scheduler never reading job stdout/stderr ([mitm_core-layer#96](https://github.com/Zheng-Bote/mitm_core-layer/issues/96)); this release hardens the job itself.
+
+### Added
+
+- **Circuit Breaker** (`max_consecutive_delivery_failures`, default `3`, negative = off): after that many transient package failures in a row (network error, timeout, HTTP 429/5xx) the run stops with status `degraded` and exit code `0` (no `restart_on_exit` loop), logs an `ERROR` to the audit log and `system_logs` (picked up by `mitm_maintenance_monitor`), and returns the remaining claimed packages to `pending` without consuming retries.
+- **`max_retry_after_seconds`** in the Cority `config_payload` caps the honored `Retry-After` pause (default and maximum `3600`).
+- **Hard Runtime Limit**: when `max_runtime_minutes` is set and the graceful shutdown has not finished 60 s after it, a watchdog resets the topic's `sending` packages to `pending`, sends the `timeout` status/audit events, writes a `WARN` to `system_logs` and terminates the process with exit code `0` (without `log.Printf`).
+
+### Changed
+
+- **Retry-After vs. Deadline**: a `Retry-After` pause that would end after the run deadline no longer sleeps into the deadline; the run stops at once with status `timeout` and the package returns to `pending` without consuming a retry (`DeliveryError.Postpone`, `OutcomePostponed`).
+- **HTTP Transport**: the adapter uses its own transport (connect timeout 30 s, TLS handshake 10 s) and closes idle connections after a network error or timeout of an upload.
+- **IPC Deadlines**: dialing the scheduler socket and every IPC write are bounded by 5 s, so a scheduler that does not read can no longer block the job.
+
 ## [v0.22.2] - 2026-11-17
 
 Ensure `max_runtime_minutes` reliably takes effect ([#8](https://github.com/Zheng-Bote/mitm__delivery_cority/issues/8)).

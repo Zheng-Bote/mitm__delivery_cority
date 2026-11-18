@@ -24,6 +24,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -467,12 +468,98 @@ func TestRetryAfterPausesNextUpload(t *testing.T) {
 		t.Fatalf("expected transient error with RetryAfter 120s, got %v", err)
 	}
 
-	// The next upload must wait for the pause; a short context proves it does not send immediately.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+	// The next upload must wait for the pause (no deadline); a cancel proves it does not send immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
 	_, err = adapter.Send(ctx, target, "11111111-1111-1111-1111-111111111112", []byte(`[{"a":"1"}]`))
 	if !errors.As(err, &delErr) || delErr.ErrorCode != "CANCELLED" {
 		t.Errorf("expected the paused upload to be cancelled, got %v", err)
+	}
+}
+
+func TestRetryAfterBeyondDeadlinePostponesWithoutWaiting(t *testing.T) {
+	var audits []string
+	adapter := NewCorityAdapter(nil, func(msg string) { audits = append(audits, msg) }, newMemTokenStore())
+	adapter.pauseUntil = time.Now().Add(10 * time.Minute)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	start := time.Now()
+	_, err := adapter.Send(ctx, corityTarget(t, "http://127.0.0.1:1", nil), "11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
+
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || !delErr.Postpone || delErr.ErrorCode != "RETRY_AFTER_EXCEEDS_DEADLINE" {
+		t.Fatalf("expected postpone error, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("must not wait for a pause that ends after the deadline")
+	}
+	if len(audits) == 0 || !strings.Contains(audits[len(audits)-1], "after the run deadline") {
+		t.Errorf("expected audit about the pause exceeding the deadline, got %v", audits)
+	}
+}
+
+func TestMaxRetryAfterSecondsCapsPause(t *testing.T) {
+	fake := &fakeCority{}
+	mux := http.NewServeMux()
+	mux.Handle("/api/", fake.handler())
+	mux.HandleFunc("/api/employeeimport", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "3000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	_, err := adapter.Send(context.Background(), corityTarget(t, srv.URL, map[string]interface{}{"max_retry_after_seconds": "60"}),
+		"11111111-1111-1111-1111-111111111111", []byte(`[{"a":"1"}]`))
+
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || delErr.RetryAfter != 60*time.Second {
+		t.Fatalf("expected RetryAfter capped to 60s, got %v", err)
+	}
+	if pause := time.Until(adapter.pauseUntil); pause > 61*time.Second || pause < 55*time.Second {
+		t.Errorf("expected pause of ~60s, got %v", pause)
+	}
+
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{{`{}`, time.Hour}, {`{"max_retry_after_seconds": 0}`, time.Hour}, {`{"max_retry_after_seconds": 7200}`, time.Hour}, {`{"max_retry_after_seconds": 30}`, 30 * time.Second}} {
+		cfg, err := ParseCorityAuthConfig([]byte(tc.raw))
+		if err != nil || cfg.retryAfterCap() != tc.want {
+			t.Errorf("%s: expected cap %v, got %v / %v", tc.raw, tc.want, cfg.retryAfterCap(), err)
+		}
+	}
+}
+
+// failingTransport fails every request and counts CloseIdleConnections calls.
+type failingTransport struct{ closes int }
+
+func (f *failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("connection reset by peer")
+}
+func (f *failingTransport) CloseIdleConnections() { f.closes++ }
+
+func TestNetworkErrorClosesIdleConnections(t *testing.T) {
+	tr := &failingTransport{}
+	adapter := NewCorityAdapter(&http.Client{Transport: tr, Timeout: time.Minute}, nil, newMemTokenStore())
+	_, _, _, err := adapter.upload(context.Background(), adapter.client, CorityAuthConfig{}, "http://cority", "token", "key", nil, 300)
+
+	var delErr *DeliveryError
+	if !errors.As(err, &delErr) || delErr.ErrorCode != "NETWORK_ERROR" {
+		t.Fatalf("expected NETWORK_ERROR, got %v", err)
+	}
+	if tr.closes != 1 {
+		t.Errorf("expected idle connections to be closed once, got %d", tr.closes)
+	}
+}
+
+func TestDefaultClientUsesBoundedTransport(t *testing.T) {
+	adapter := NewCorityAdapter(nil, nil, newMemTokenStore())
+	tr, ok := adapter.client.Transport.(*http.Transport)
+	if !ok || tr.TLSHandshakeTimeout != 10*time.Second || tr.DialContext == nil {
+		t.Fatalf("expected own transport with TLS handshake timeout 10s, got %#v", adapter.client.Transport)
 	}
 }
 

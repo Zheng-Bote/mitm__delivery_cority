@@ -52,7 +52,8 @@ ARGS_JSON='{
   "blocking_max_runtime_minutes": 360,
   "max_consecutive_errors": 5,
   "max_runtime_minutes": 120,
-  "max_retry_wait_seconds": 300
+  "max_retry_wait_seconds": 300,
+  "max_consecutive_delivery_failures": 3
 }'
 
 ./bin/mitm-cority "$ARGS_JSON"
@@ -72,19 +73,20 @@ ARGS_JSON='{
 | `blocking_jobs` | `[]` | Scheduled program names; if one of them has an unfinished `program_runs` entry, the job exits with code 0. |
 | `blocking_max_runtime_minutes` | `0` | Ignores blocking runs started longer ago than this (protects against stale runs left by crashed jobs). `0` = no limit. |
 | `max_consecutive_errors` | `5` | Aborts the job (exit code `1`) after this many failed DB claim attempts in a row; attempts back off 2, 4, 8 … s (max 30 s). |
-| `max_runtime_minutes` | `0` | Stops the job gracefully after this time (status `timeout`, exit code `0`); remaining packages are left for the next run. Also read from `config_payload` (`max_runtime_minutes` or `upload_options.max_runtime_minutes`) when `0` in job args. `0` = no limit. |
+| `max_runtime_minutes` | `0` | Stops the job gracefully after this time (status `timeout`, exit code `0`); remaining packages are left for the next run. Also read from `config_payload` (`max_runtime_minutes` or `upload_options.max_runtime_minutes`) when `0` in job args. `0` = no limit. **Hard limit:** if the graceful shutdown has not finished 60 s after this time, a watchdog resets the topic's `sending` packages to `pending`, sends the `timeout` events and terminates the process (exit code `0`). |
 | `max_retry_wait_seconds` | `300` | If only retries are left and the next one is due within this time, the job waits and delivers it in the same run. Negative = off. |
+| `max_consecutive_delivery_failures` | `3` | Circuit breaker: after this many packages in a row failed transiently (network error, timeout, HTTP 429/5xx), the run stops (status `degraded`, exit code `0`, `ERROR` in `system_logs`); the remaining claimed packages return to `pending` without consuming a retry. A delivered package or a non-transient failure resets the count. Negative = off. |
 
 #### Exit Codes & Recovery
 
 | Exit Code | Meaning |
 |---|---|
 | `0` | Finished (or exited because of a blocking job / another instance of the topic). |
-| `0` | Also on `max_runtime_minutes` reached (status `timeout`) or SIGTERM (status `cancelled`). |
+| `0` | Also on `max_runtime_minutes` reached (status `timeout`), a `Retry-After` pause ending after the deadline (status `timeout`), the circuit breaker (status `degraded`, logged as `ERROR` so `mitm_maintenance_monitor` alerts) or SIGTERM (status `cancelled`). |
 | `1` | Fatal error, e.g. invalid DB config, wrong `MASTER_KEY` (must decode to 32 bytes), undecryptable or invalid `config_payload`, failed encrypted-field lookup, Cority authentication failure (`AUTH_FAIL`), or `max_consecutive_errors` reached. No package is moved to the DLQ because of these errors. |
 | `2` | Finished, but at least one package or record was moved to the DLQ or a package state could not be persisted. |
 
-The final IPC status event (`finished`, `failed`, `timeout` or `cancelled`) carries the counts of delivered, retry-scheduled, DLQ, withheld-record and interrupted packages.
+The final IPC status event (`finished`, `failed`, `degraded`, `timeout` or `cancelled`) carries the counts of delivered, retry-scheduled, DLQ, withheld-record and interrupted packages.
 Packages left in status `sending` (crash, SIGTERM) are reset to `pending` at the start and at the end of every run.
 **Note:** Jobs with `restart_on_exit = true` are restarted once by the scheduler after exit code `2`.
 
@@ -105,6 +107,7 @@ When configuring the Target via the Admin Frontend, the `Config Payload` JSON di
   "import_path": "/api/employeeimport",
   "slowdown": "5",
   "timeout": "300",
+  "max_retry_after_seconds": "600",
   "upload_options": {
     "import_mode": "upsert",
     "batch_size": 500,
@@ -126,7 +129,8 @@ When configuring the Target via the Admin Frontend, the `Config Payload` JSON di
 - If Cority rejects a cached access token (HTTP 401), the adapter invalidates it, re-authenticates once and retries the request.
 - All data is sent to Cority **decrypted**. Values in envelope format (`{"ciphertext": ..., "nonce": ...}`) are always decrypted; string values are decrypted for the fields marked `encrypted` in the mapping.
 - A record with any undecryptable field is **never sent**. The other records of the package are delivered; the withheld record is stored (still encrypted) as its own row in `dead_letter_queue` (`DECRYPT_FAIL`).
-- On HTTP 429/5xx with a `Retry-After` header, the package is rescheduled at least that far ahead (max 1 h) and further uploads pause until then.
+- On HTTP 429/5xx with a `Retry-After` header, the package is rescheduled at least that far ahead and further uploads pause until then. The pause is capped by the optional `max_retry_after_seconds` (JSON string or number, default and maximum `3600`). If the pause would end after the run deadline (`max_runtime_minutes`), the run stops at once (status `timeout`) and the package returns to `pending` without consuming a retry. The pause is kept in memory only; the next run may send one request before it learns the pause again.
+- Connect and TLS handshake are bounded (30 s / 10 s) independently of `timeout`; after a network error or timeout, idle HTTP connections are closed so the next upload uses a fresh connection.
 - Cority authentication failures (`AUTH_FAIL`) abort the job (exit code `1`); the affected package returns to `pending` without consuming a retry.
 
 The adapter uses this configuration to assemble the final payload for the target API. Specifically, the data is uploaded in the following format:
