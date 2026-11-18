@@ -130,3 +130,46 @@ func TestNilClientIsSafe(t *testing.T) {
 	c.SendAudit("x")
 	c.Close()
 }
+
+func TestSendDoesNotBlockWhenSchedulerDoesNotRead(t *testing.T) {
+	old := ipcTimeout
+	ipcTimeout = 200 * time.Millisecond
+	defer func() { ipcTimeout = old }()
+
+	path := filepath.Join(t.TempDir(), "scheduler.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var conns []net.Conn
+	var mu sync.Mutex
+	go func() {
+		for {
+			conn, err := ln.Accept() // accept, but never read
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	c := &IPCClient{SocketPath: path, RunID: 1, Component: "test"}
+	defer c.Close()
+	big := string(make([]byte, 4<<20)) // larger than any socket buffer
+	start := time.Now()
+	c.SendAudit(big)
+	// One attempt plus one re-dial, each bounded by ipcTimeout.
+	if elapsed := time.Since(start); elapsed > 2*ipcTimeout+time.Second {
+		t.Fatalf("SendAudit blocked for %v", elapsed)
+	}
+}

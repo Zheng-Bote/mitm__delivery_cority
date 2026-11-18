@@ -7,8 +7,8 @@
  *
  * @file main.go
  * @brief Entry point: packages target fragments and delivers them to Cority SaaS
- * @version 0.22.2
- * @date 2026-11-17
+ * @version 0.23.0
+ * @date 2026-11-18
  *
  * @author ZHENG Robert (robert@hase-zheng.net)
  * @copyright Copyright (c) 2026 ZHENG Robert
@@ -47,7 +47,7 @@ import (
 var (
 	appName        = "Delivery Engine"
 	appDescription = "Delivers packaged data to target systems"
-	version        = "0.22.2"
+	version        = "0.23.0"
 )
 
 // flexInt accepts a JSON number or a numeric JSON string ("" and null count as 0).
@@ -82,6 +82,56 @@ type JobArgs struct {
 	MaxRuntimeMinutes flexInt `json:"max_runtime_minutes"`
 	// MaxRetryWaitSeconds waits in-run for retries due within this time (0 = default 300, negative = off).
 	MaxRetryWaitSeconds flexInt `json:"max_retry_wait_seconds"`
+	// MaxConsecutiveDeliveryFailures stops the run after this many transient package failures in a row (0 = default 3, negative = off).
+	MaxConsecutiveDeliveryFailures flexInt `json:"max_consecutive_delivery_failures"`
+}
+
+// hardStopGrace is how long a run may take to shut down gracefully after max_runtime_minutes.
+const hardStopGrace = 60 * time.Second
+
+// exitProcess terminates the process; replaced in tests.
+var exitProcess = os.Exit
+
+// stopReason records why a run was stopped before all packages were processed.
+type stopReason int32
+
+const (
+	stopNone      stopReason = iota
+	stopAbort                // job-level failure (e.g. authentication)
+	stopDegraded             // circuit breaker: the target keeps failing transiently
+	stopPostponed            // the target asked for a pause that ends after the run deadline
+)
+
+// runControl stops a run and implements the circuit breaker over consecutive transient failures.
+type runControl struct {
+	cancel      context.CancelFunc
+	maxFailures int // <= 0 disables the circuit breaker
+	reason      atomic.Int32
+	failures    atomic.Int64
+}
+
+// stop cancels the run; the first reason wins.
+func (rc *runControl) stop(r stopReason) {
+	rc.reason.CompareAndSwap(int32(stopNone), int32(r))
+	rc.cancel()
+}
+
+func (rc *runControl) stopReason() stopReason {
+	return stopReason(rc.reason.Load())
+}
+
+// recordResult updates the consecutive transient failure count and reports whether the breaker tripped.
+func (rc *runControl) recordResult(outcome engine.Outcome, err error) bool {
+	var delErr *delivery.DeliveryError
+	transient := errors.As(err, &delErr) && delErr.IsTransient
+	switch {
+	case outcome == engine.OutcomeRetry || (outcome == engine.OutcomeDLQ && transient):
+		n := rc.failures.Add(1)
+		return rc.maxFailures > 0 && n == int64(rc.maxFailures)
+	case outcome == engine.OutcomeDelivered || outcome == engine.OutcomeDLQ:
+		rc.failures.Store(0)
+	}
+	return false
 }
 
 // deliveryStats counts package outcomes across workers.
@@ -105,13 +155,15 @@ func shouldWaitForRetry(ctx context.Context, next time.Time, maxRetryWait time.D
 }
 
 // resolveTerminalOutcome maps run state to the final IPC status and process exit code.
-// A graceful max-runtime timeout or signal cancellation returns exit code 0 even if earlier packages
-// had DLQ/rejected records so that scheduler restart_on_exit does not restart a timed-out or stopped run.
-func resolveTerminalOutcome(ctxErr error, aborted, claimFailed, packagingFailed bool, stats *deliveryStats) (string, int) {
+// A graceful max-runtime timeout, a degraded target or signal cancellation returns exit code 0 even if earlier
+// packages had DLQ/rejected records so that scheduler restart_on_exit does not restart a timed-out or stopped run.
+func resolveTerminalOutcome(ctxErr error, reason stopReason, claimFailed, packagingFailed bool, stats *deliveryStats) (string, int) {
 	switch {
-	case aborted || claimFailed || packagingFailed:
+	case reason == stopAbort || claimFailed || packagingFailed:
 		return "failed", 1
-	case errors.Is(ctxErr, context.DeadlineExceeded):
+	case reason == stopDegraded:
+		return "degraded", 0
+	case reason == stopPostponed || errors.Is(ctxErr, context.DeadlineExceeded):
 		return "timeout", 0
 	case ctxErr != nil:
 		return "cancelled", 0
@@ -226,7 +278,7 @@ func finishRun(ipcClient *ipc.IPCClient, pool *pgxpool.Pool, jobName, status, su
 		jobName = appName
 	}
 	level := "INFO"
-	if status == "failed" {
+	if status == "failed" || status == "degraded" {
 		level = "ERROR"
 		logAudit(ipcClient, "ERROR: "+summary)
 	} else {
@@ -309,6 +361,9 @@ func run() int {
 	}
 	if jobArgs.MaxRetryWaitSeconds == 0 {
 		jobArgs.MaxRetryWaitSeconds = 300
+	}
+	if jobArgs.MaxConsecutiveDeliveryFailures == 0 {
+		jobArgs.MaxConsecutiveDeliveryFailures = 3
 	}
 	if jobArgs.Topic != "" {
 		jobName = "Delivery " + jobArgs.Topic
@@ -490,11 +545,15 @@ func run() int {
 		defer cancelRuntime()
 	}
 
-	// abortJob stops all processing after a job-level failure (e.g. authentication)
-	var aborted atomic.Bool
-	abortJob := func() {
-		aborted.Store(true)
-		cancel()
+	// rc stops all processing after a job-level failure, a degraded target or a postponed run
+	rc := &runControl{cancel: cancel, maxFailures: int(jobArgs.MaxConsecutiveDeliveryFailures)}
+
+	// Hard limit: terminate the process if the graceful shutdown does not finish after the deadline.
+	if jobArgs.MaxRuntimeMinutes > 0 {
+		watchdog := time.AfterFunc(time.Duration(jobArgs.MaxRuntimeMinutes)*time.Minute+hardStopGrace, func() {
+			hardStop(ipcClient, pool, pkgRepo, jobName, jobArgs.Topic, int(jobArgs.MaxRuntimeMinutes), exitProcess)
+		})
+		defer watchdog.Stop()
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -521,7 +580,7 @@ func run() int {
 	// Start workers
 	for i := 0; i < int(jobArgs.Workers); i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, auditFn, &stats, abortJob)
+		go worker(ctx, &wg, &batch, jobs, retryEngine, sender, *targetConfig, auditFn, &stats, rc)
 	}
 
 	// 6. Packager: Create delivery packages from target_fragments
@@ -635,19 +694,19 @@ dispatcherLoop:
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		logAudit(ipcClient, fmt.Sprintf("Max runtime of %d minutes reached; remaining packages are left for the next run", jobArgs.MaxRuntimeMinutes))
 	}
-	status, exitCode := resolveTerminalOutcome(ctx.Err(), aborted.Load(), claimFailed, packagingFailed, &stats)
+	status, exitCode := resolveTerminalOutcome(ctx.Err(), rc.stopReason(), claimFailed, packagingFailed, &stats)
 	return finishRun(ipcClient, pool, jobName, status, summary, exitCode)
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, batch *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, abortJob func()) {
+func worker(ctx context.Context, wg *sync.WaitGroup, batch *sync.WaitGroup, jobs <-chan db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, rc *runControl) {
 	defer wg.Done()
 	for pkg := range jobs {
-		processPackage(ctx, pkg, retryEngine, sender, config, logAudit, stats, abortJob)
+		processPackage(ctx, pkg, retryEngine, sender, config, logAudit, stats, rc)
 		batch.Done()
 	}
 }
 
-func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, abortJob func()) {
+func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.RetryEngine, sender delivery.DeliverySender, config delivery.TargetConfig, logAudit func(string), stats *deliveryStats, rc *runControl) {
 	if ctx.Err() != nil {
 		// Shutdown: leave the package in 'sending'; it is reset to 'pending' after all workers stopped.
 		stats.interrupted.Add(1)
@@ -658,7 +717,13 @@ func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.Ret
 	switch res.Outcome {
 	case engine.OutcomeAbort:
 		logAudit(fmt.Sprintf("Aborting job: %v", err))
-		abortJob()
+		rc.stop(stopAbort)
+	case engine.OutcomePostponed:
+		// Left in 'sending'; reset to 'pending' after all workers stopped.
+		stats.interrupted.Add(1)
+		logAudit(fmt.Sprintf("Package %s postponed: %v; remaining packages are left for the next run", pkg.ID, err))
+		rc.stop(stopPostponed)
+		return
 	case engine.OutcomeDelivered:
 		stats.delivered.Add(1)
 	case engine.OutcomeRetry:
@@ -677,6 +742,31 @@ func processPackage(ctx context.Context, pkg db.Package, retryEngine *engine.Ret
 	} else {
 		logAudit(fmt.Sprintf("Package %s delivered successfully", pkg.ID))
 	}
+	if rc.recordResult(res.Outcome, err) {
+		logAudit(fmt.Sprintf("ERROR: Target seems degraded: %d packages in a row failed transiently; stopping the run, remaining packages are left for the next run", rc.maxFailures))
+		rc.stop(stopDegraded)
+	}
+}
+
+// hardStop ends a run that did not shut down within hardStopGrace after max_runtime_minutes.
+// It must not use log.Printf, which blocks when the job's stderr is not read.
+func hardStop(ipcClient *ipc.IPCClient, pool *pgxpool.Pool, pkgRepo *db.PackageRepo, jobName, topic string, maxRuntimeMinutes int, exit func(int)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	msg := fmt.Sprintf("Max runtime of %d minutes reached and the graceful shutdown did not finish within %v; terminating the job", maxRuntimeMinutes, hardStopGrace)
+	if pkgRepo != nil {
+		if n, err := pkgRepo.ResetSending(ctx, topic); err == nil && n > 0 {
+			msg += fmt.Sprintf("; reset %d packages from 'sending' to 'pending'", n)
+		}
+	}
+	ipcClient.SendAudit("WARNING: " + msg)
+	ipcClient.SendEvent("timeout", msg, 100)
+	ipcClient.SendAudit(fmt.Sprintf("%s (%s) timeout", appName, versionTag()))
+	if pool != nil {
+		_, _ = pool.Exec(ctx, "INSERT INTO system_logs (level, component, message) VALUES ('WARN', 'mitm_delivery', $1)",
+			fmt.Sprintf("Job %s (%s) timeout: %s", jobName, versionTag(), msg))
+	}
+	exit(0)
 }
 
 func fetchCredentialsFromScheduler() (string, string, error) {

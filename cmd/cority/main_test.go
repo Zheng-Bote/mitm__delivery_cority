@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -286,17 +287,17 @@ func TestResolveTerminalOutcomeTimeoutPrecedesDLQ(t *testing.T) {
 	stats.dlq.Store(1)
 	stats.rejected.Store(2)
 
-	status, code := resolveTerminalOutcome(context.DeadlineExceeded, false, false, false, &stats)
+	status, code := resolveTerminalOutcome(context.DeadlineExceeded, stopNone, false, false, &stats)
 	if status != "timeout" || code != 0 {
 		t.Fatalf("expected timeout/0 even with prior DLQ records, got %s/%d", status, code)
 	}
 
-	status, code = resolveTerminalOutcome(nil, false, false, false, &stats)
+	status, code = resolveTerminalOutcome(nil, stopNone, false, false, &stats)
 	if status != "failed" || code != 2 {
 		t.Fatalf("expected failed/2 when no deadline exceeded, got %s/%d", status, code)
 	}
 
-	status, code = resolveTerminalOutcome(context.DeadlineExceeded, true, false, false, &stats)
+	status, code = resolveTerminalOutcome(context.DeadlineExceeded, stopAbort, false, false, &stats)
 	if status != "failed" || code != 1 {
 		t.Fatalf("expected failed/1 when job aborted, got %s/%d", status, code)
 	}
@@ -334,7 +335,7 @@ func TestProcessPackageInterruptedDoesNotLogPackageFailed(t *testing.T) {
 	go func() {
 		processPackage(ctx, db.Package{ID: "pkg-1"}, re, blockingSender{}, delivery.TargetConfig{}, func(msg string) {
 			audits = append(audits, msg)
-		}, &stats, func() {})
+		}, &stats, &runControl{cancel: func() {}})
 		close(done)
 	}()
 
@@ -346,5 +347,131 @@ func TestProcessPackageInterruptedDoesNotLogPackageFailed(t *testing.T) {
 	}
 	if len(audits) != 0 {
 		t.Errorf("interrupted package must not emit failure audit, got %v", audits)
+	}
+}
+
+func TestResolveTerminalOutcomeStopReasons(t *testing.T) {
+	var stats deliveryStats
+	stats.dlq.Store(1)
+	for _, tc := range []struct {
+		reason     stopReason
+		wantStatus string
+		wantCode   int
+	}{
+		{stopDegraded, "degraded", 0},
+		{stopPostponed, "timeout", 0},
+		{stopAbort, "failed", 1},
+	} {
+		status, code := resolveTerminalOutcome(context.Canceled, tc.reason, false, false, &stats)
+		if status != tc.wantStatus || code != tc.wantCode {
+			t.Errorf("reason %d: expected %s/%d, got %s/%d", tc.reason, tc.wantStatus, tc.wantCode, status, code)
+		}
+	}
+}
+
+// scriptedSender returns the next error of its script for every Send (nil = success).
+type scriptedSender struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (s *scriptedSender) Send(context.Context, delivery.TargetConfig, string, []byte) (delivery.SendResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.errs[0]
+	s.errs = s.errs[1:]
+	return delivery.SendResult{}, err
+}
+
+type nopPackageRepo struct{}
+
+func (nopPackageRepo) UpdateStatusDelivered(context.Context, string) error { return nil }
+func (nopPackageRepo) UpdateStatusFailed(context.Context, string, string, time.Time, int) error {
+	return nil
+}
+
+type nopDLQRepo struct{}
+
+func (nopDLQRepo) MoveToDLQ(context.Context, db.Package, string, string) error { return nil }
+func (nopDLQRepo) InsertRejectedRecords(context.Context, string, []delivery.RejectedRecord) error {
+	return nil
+}
+
+func TestCircuitBreakerStopsRunAfterConsecutiveTransientFailures(t *testing.T) {
+	unavailable := &delivery.DeliveryError{IsTransient: true, HTTPCode: 503, ErrorCode: "HTTP_503", ErrorMessage: "HTTP 503"}
+	badRequest := &delivery.DeliveryError{IsTransient: false, HTTPCode: 400, ErrorCode: "HTTP_400", ErrorMessage: "HTTP 400"}
+	// fail, fail, delivered (reset), fail, fatal 400 (reset), fail, fail, fail (trip)
+	sender := &scriptedSender{errs: []error{unavailable, unavailable, nil, unavailable, badRequest, unavailable, unavailable, unavailable}}
+	re := engine.NewRetryEngine(nopPackageRepo{}, nopDLQRepo{}, 5)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := &runControl{cancel: cancel, maxFailures: 3}
+	var stats deliveryStats
+	var audits []string
+	for i := 0; i < 8; i++ {
+		if ctx.Err() != nil {
+			t.Fatalf("breaker tripped too early, before package %d", i)
+		}
+		processPackage(ctx, db.Package{ID: fmt.Sprintf("pkg-%d", i)}, re, sender, delivery.TargetConfig{}, func(msg string) {
+			audits = append(audits, msg)
+		}, &stats, rc)
+	}
+
+	if rc.stopReason() != stopDegraded || ctx.Err() == nil {
+		t.Fatalf("expected the breaker to stop the run as degraded, got reason %d / ctx %v", rc.stopReason(), ctx.Err())
+	}
+	if !strings.HasPrefix(audits[len(audits)-1], "ERROR: Target seems degraded") {
+		t.Errorf("expected degraded ERROR audit, got %q", audits[len(audits)-1])
+	}
+	// A further claimed package is not sent but left for the next run.
+	processPackage(ctx, db.Package{ID: "pkg-next"}, re, sender, delivery.TargetConfig{}, func(string) {}, &stats, rc)
+	if stats.interrupted.Load() != 1 {
+		t.Errorf("expected the next package to be interrupted, got %d", stats.interrupted.Load())
+	}
+}
+
+func TestCircuitBreakerDisabledWithNegativeLimit(t *testing.T) {
+	rc := &runControl{cancel: func() {}, maxFailures: -1}
+	transient := &delivery.DeliveryError{IsTransient: true}
+	for i := 0; i < 10; i++ {
+		if rc.recordResult(engine.OutcomeRetry, transient) {
+			t.Fatal("breaker must not trip when disabled")
+		}
+	}
+}
+
+func TestPostponedPackageStopsRunAsTimeout(t *testing.T) {
+	sender := &scriptedSender{errs: []error{&delivery.DeliveryError{IsTransient: true, Postpone: true, ErrorCode: "RETRY_AFTER_EXCEEDS_DEADLINE"}}}
+	re := engine.NewRetryEngine(nopPackageRepo{}, nopDLQRepo{}, 5)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc := &runControl{cancel: cancel, maxFailures: 3}
+	var stats deliveryStats
+
+	processPackage(ctx, db.Package{ID: "pkg-1"}, re, sender, delivery.TargetConfig{}, func(string) {}, &stats, rc)
+
+	if rc.stopReason() != stopPostponed || stats.interrupted.Load() != 1 || stats.retry.Load() != 0 {
+		t.Fatalf("expected postponed stop without retry, got reason %d, interrupted %d, retry %d", rc.stopReason(), stats.interrupted.Load(), stats.retry.Load())
+	}
+	if status, code := resolveTerminalOutcome(ctx.Err(), rc.stopReason(), false, false, &stats); status != "timeout" || code != 0 {
+		t.Errorf("expected timeout/0, got %s/%d", status, code)
+	}
+}
+
+func TestHardStopSendsTimeoutAndExits(t *testing.T) {
+	sched, path := startTestScheduler(t)
+	client := &ipc.IPCClient{SocketPath: path, RunID: 7, Component: "mitm_delivery"}
+	defer client.Close()
+
+	exitCode := -1
+	hardStop(client, nil, nil, "Delivery test", "test", 5, func(code int) { exitCode = code })
+
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+	events := sched.waitCount(t, 3)
+	if !strings.HasPrefix(events[0].Message, "WARNING: Max runtime of 5 minutes reached") || events[1].Type != "status" || events[1].Status != "timeout" {
+		t.Errorf("unexpected hard stop events: %+v", events)
 	}
 }

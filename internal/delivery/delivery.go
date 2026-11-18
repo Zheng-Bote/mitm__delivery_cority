@@ -34,6 +34,9 @@ type DeliveryError struct {
 	RetryAfter time.Duration
 	// Abort stops the whole job without consuming a retry (e.g. authentication failure).
 	Abort bool
+	// Postpone stops the run without consuming a retry; the package returns to 'pending'
+	// (e.g. a Retry-After pause that ends after the run deadline).
+	Postpone bool
 }
 
 func (e *DeliveryError) Error() string {

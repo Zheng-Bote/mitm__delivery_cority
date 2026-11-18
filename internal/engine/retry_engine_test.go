@@ -239,6 +239,23 @@ func TestRetryEngine_AbortLeavesPackageUntouched(t *testing.T) {
 	}
 }
 
+func TestRetryEngine_PostponeLeavesPackageUntouched(t *testing.T) {
+	pkgRepo := &mockPackageRepo{}
+	dlqRepo := &mockDLQRepo{}
+	eng := engine.NewRetryEngine(pkgRepo, dlqRepo, 3)
+
+	sender := &mockSender{
+		err: &delivery.DeliveryError{IsTransient: true, Postpone: true, ErrorCode: "RETRY_AFTER_EXCEEDS_DEADLINE", ErrorMessage: "pause ends after deadline"},
+	}
+	res, err := eng.ProcessPackage(context.Background(), db.Package{ID: "pkg-9", RetryCount: 1}, sender, delivery.TargetConfig{})
+	if err == nil || res.Outcome != engine.OutcomePostponed {
+		t.Fatalf("expected OutcomePostponed with error, got %d / %v", res.Outcome, err)
+	}
+	if pkgRepo.failedID != "" || pkgRepo.deliveredID != "" || dlqRepo.pkg.ID != "" {
+		t.Errorf("postponed package must not be updated (no retry consumed) or moved to DLQ")
+	}
+}
+
 func TestRetryEngine_RejectedRecordsGoToDLQ(t *testing.T) {
 	pkgRepo := &mockPackageRepo{}
 	dlqRepo := &mockDLQRepo{}
